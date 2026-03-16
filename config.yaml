@@ -1,0 +1,84 @@
+# ==========================================
+# IMPOSTAZIONI GLOBALI
+# ==========================================
+experiment_mode: "single" # Scegli: "single" oppure "batch"
+active_model: "xgb"       # Scegli: "qrf" (Random Forest) oppure "xgb" (XGBoost), "tabpfn"
+
+directories:
+  val_data: "chico_calib_extraction.pkl"
+  test_data: "chico_extraction.pkl"
+  results_base: "risultati"
+
+model_params:
+  n_joints: 15
+  random_state: 42
+  k_neighbors: 1000
+
+
+# ==========================================
+# TUNING COLLISIONI (Metodo Dinamico vs Standard)
+# ==========================================
+
+collision_tuning:
+  mode: "dynamic" # Metti "standard" (ellissoidi) oppure "dynamic" (grid search cilindri gonfiati)
+  m_bases: [0.03, 0.05, 0.08] # Margine di errore in metri
+  taus: [0.05, 0.08, 0.1]     # Orizzonte temporale di reazione in secondi
+
+# ==========================================
+# MODALITA' SINGOLA (Test veloci e Debug)
+# ==========================================
+single_run:
+  ablation:
+    use_knn_matrices: false
+    temporal_strategy: "per_horizon" # "per_horizon" o "constant"
+    use_distances: false
+    use_time_feature: true
+    past_window: 3
+    
+  qrf:
+    alpha: 0.1
+    n_estimators: 15
+    max_depth: 3
+    
+  xgb:
+    alpha: 0.1
+    n_estimators: 200
+    max_depth: 3
+    learning_rate: 0.1
+    subsample: 0.8
+    colsample_bytree: 0.9
+    min_child_weight: 3
+    device: "cpu"
+
+  tabpfn:
+    alpha: 0.9
+    device: "cuda"
+# ==========================================
+# MODALITA' BATCH (Addestramento Massivo Notturno)
+# ==========================================
+batch_run:
+  ablation:
+    use_knn_matrices: [false]
+    temporal_strategy: ["per_horizon"]
+    use_distances: [false]
+    use_time_feature: [true]
+    past_window: [2, 5, 10, 25]
+
+  qrf:
+    alpha: [0.05, 0.1]
+    n_estimators: [15, 50]
+    max_depth: [3, 5]
+
+  xgb:
+    alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    n_estimators: [100]
+    max_depth: [2, 4, 6]
+    learning_rate: [0.1]
+    subsample: [0.8]
+    colsample_bytree: [0.9]
+    min_child_weight: [3]
+    device: ["cuda"]
+
+  tabpfn:
+    alpha: [0.9]       # deve essere lista per itertools.product nel batch mode
+    device: ["cuda"]
