@@ -5,6 +5,7 @@ import itertools
 import time
 import copy
 import pickle
+import gc
 
 from data_prep import process_offline_data
 from score_extraction import process_and_save_scores
@@ -180,6 +181,11 @@ def run_experiment(config: dict, offline_artifacts: dict, is_batch: bool = False
         pickle.dump(val_results_bundle, f)
 
     run_fcl_evaluation(val_bundle_path, config, cache_file='VAL_gt_collisions_cache.pkl')
+
+    # Libera risorse thread Windows dopo la grid search prima di avviare Fase 4.
+    # Evita WinError 1450 (esaurimento nonpaged pool) su run lunghi.
+    gc.collect()
+    time.sleep(3)
 
     # Rinomina il file di risultati FCL del validation per non sovrascriverlo alla Fase 5
     old_txt = os.path.join(exp_dir, 'fcl_evaluation_results.txt')
