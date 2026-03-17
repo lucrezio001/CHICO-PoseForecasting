@@ -155,18 +155,39 @@ def run_test_inference(
     use_distances = abl_cfg.get('use_distances', True)
     use_time = abl_cfg.get('use_time_feature', True)
     past_window = abl_cfg.get('past_window', 2)
-    
-    for j in range(15):
-        group = KINEMATIC_GROUPS.get(j, [j])
-        for h in range(1, 26):
-            X_h = build_feature_matrix(
-                X_test_scaled, h, true_test_scores, group,
-                use_distances, use_time, past_window
-            )
-                
-            regressor = models_dict[j][h]
-            preds_h = np.maximum(regressor.predict(X_h), 0)
-            predicted_thresholds[:, h-1, j] = preds_h
+
+    # Detect TabPFN Option A: models_dict[j]['pooled'] invece di models_dict[j][h]
+    is_pooled = isinstance(models_dict.get(0), dict) and 'pooled' in models_dict.get(0, {})
+
+    if is_pooled:
+        # ── TabPFN Option A: 1 predict per giunto su tutti e 25 gli orizzonti ─
+        # Stack (25 * N_test) campioni → 1 sola chiamata GPU per giunto (15 totali).
+        # La KV cache è già attiva (fit_mode="fit_with_cache") → nessun ricalcolo
+        # del training set per ogni batch.
+        log.info("TabPFN pooled: 15 predict calls (25 orizzonti per giunto in una sola chiamata)...")
+        for j in range(15):
+            group = KINEMATIC_GROUPS.get(j, [j])
+            X_parts = [
+                build_feature_matrix(X_test_scaled, h, true_test_scores, group,
+                                     use_distances, use_time, past_window)
+                for h in range(1, 26)
+            ]
+            X_all = np.vstack(X_parts)  # (25 * N_test, n_feat)
+            preds_all = np.maximum(models_dict[j]['pooled'].predict(X_all), 0)
+            for h in range(1, 26):
+                predicted_thresholds[:, h-1, j] = preds_all[(h-1)*N_test : h*N_test]
+    else:
+        # ── Path classico: 375 predict calls (XGB / QRF) ─────────────────────
+        for j in range(15):
+            group = KINEMATIC_GROUPS.get(j, [j])
+            for h in range(1, 26):
+                X_h = build_feature_matrix(
+                    X_test_scaled, h, true_test_scores, group,
+                    use_distances, use_time, past_window
+                )
+                regressor = models_dict[j][h]
+                preds_h = np.maximum(regressor.predict(X_h), 0)
+                predicted_thresholds[:, h-1, j] = preds_h
 
     log.info("Assemblaggio risultati finali...")
     # (15, 25, N_test, 3, 3) → transpose → (N_test, 25, 15, 3, 3)

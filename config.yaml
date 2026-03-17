@@ -1,7 +1,7 @@
 # ==========================================
 # IMPOSTAZIONI GLOBALI
 # ==========================================
-experiment_mode: "single" # Scegli: "single" oppure "batch"
+experiment_mode: "batch" # Scegli: "single" oppure "batch"
 active_model: "tabpfn"       # Scegli: "qrf" (Random Forest) oppure "xgb" (XGBoost), "tabpfn"
 
 directories:
@@ -53,7 +53,8 @@ single_run:
   tabpfn:
     alpha: 0.9
     device: "cuda"
-    subsample_size: 4000  # Max campioni per modello (TabPFN: limite pratico ~4000-8000)
+    subsample_size: 100       # Max campioni training per modello (TabPFN: limite pratico ~4000-8000)
+    predict_batch_size: 2000  # Batch inferenza: evita CUDA OOM sul test set (~61k campioni)
 # ==========================================
 # MODALITA' BATCH (Addestramento Massivo Notturno)
 # ==========================================
@@ -61,7 +62,7 @@ batch_run:
   ablation:
     use_knn_matrices: [false]
     temporal_strategy: ["per_horizon"]
-    use_distances: [false]
+    use_distances: [true]
     use_time_feature: [true]
     past_window: [2, 5, 10, 25]
 
@@ -81,6 +82,7 @@ batch_run:
     device: ["cuda"]
 
   tabpfn:
-    alpha: [0.9]              # deve essere lista per itertools.product nel batch mode
+    alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]  # deve essere lista per itertools.product nel batch mode
     device: ["cuda"]
-    subsample_size: [4000]    # Max campioni per modello; 0 = nessun subsample
+    subsample_size: [1000, 3000, 6000]        # Max campioni training per modello; 0 = nessun subsample
+    predict_batch_size: [4000]    # Batch inferenza; 0 = nessun batching

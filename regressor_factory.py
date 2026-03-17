@@ -54,20 +54,35 @@ class TabPFNQuantileWrapper:
 
     Usa output_type="quantiles" per ottenere il quantile (1 - alpha),
     identico al comportamento di XGBQuantileWrapper e QRF.
+
+    Il parametro predict_batch_size divide il test set in batch durante
+    l'inferenza per evitare CUDA OOM (il test set CHICO ha ~61k campioni,
+    troppi per stare in una sola passata sulla GPU).
     """
-    def __init__(self, alpha: float, device: str = 'cpu'):
+    def __init__(self, alpha: float, device: str = 'cpu', predict_batch_size: int = 2000):
         self.target_quantile = 1.0 - alpha
-        self.model = TabPFNRegressor(device=device)
+        self.predict_batch_size = predict_batch_size
+        # fit_mode="fit_with_cache": pre-calcola la KV representation del training set
+        # durante fit() → predict() più veloce perché non ricalcola il contesto per ogni batch.
+        self.model = TabPFNRegressor(device=device, fit_mode="fit_with_cache")
 
     def fit(self, X, y):
         self.model.fit(X, y)
         return self
 
-    def predict(self, X):
-        preds = self.model.predict(X, output_type="quantiles", quantiles=[self.target_quantile])
-        # predict() con output_type="quantiles" restituisce una lista di array,
-        # uno per ogni quantile richiesto → prendiamo il primo (e unico).
-        return preds[0]
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predice in batch per evitare CUDA OOM su dataset di grandi dimensioni."""
+        n = X.shape[0]
+        if self.predict_batch_size <= 0 or n <= self.predict_batch_size:
+            preds = self.model.predict(X, output_type="quantiles", quantiles=[self.target_quantile])
+            return preds[0]
+
+        results = []
+        for start in range(0, n, self.predict_batch_size):
+            batch = X[start : start + self.predict_batch_size]
+            preds = self.model.predict(batch, output_type="quantiles", quantiles=[self.target_quantile])
+            results.append(preds[0])
+        return np.concatenate(results, axis=0)
 
 def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | object:
     """
@@ -112,10 +127,10 @@ def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper 
             xgb_kwargs=run_cfg 
         )
     elif reg_type == 'tabpfn':
-        # Creiamo il nuovo regressore TabPFN!
         return TabPFNQuantileWrapper(
             alpha=alpha,
-            device=run_cfg.get('device', 'cpu')
+            device=run_cfg.get('device', 'cpu'),
+            predict_batch_size=run_cfg.get('predict_batch_size', 2000),
         )
     else:
         raise ValueError(f"Regressore '{reg_type}' non riconosciuto.")
