@@ -70,6 +70,10 @@ _MAX_ANAT_RADIUS = max(SEGMENT_RADII.values())
 _CONN_ROBOT_A = np.array([a for a, b in CONN_ROBOT])
 _CONN_ROBOT_B = np.array([b for a, b in CONN_ROBOT])
 
+# Array numpy per calcolo vettorizzato dei segmenti umani (usati in precompute_dynamic_tensors).
+_SEG_A = np.array([a for a, b in CONN_HUMAN])  # (16,) — indice giunto A per ogni segmento
+_SEG_B = np.array([b for a, b in CONN_HUMAN])  # (16,) — indice giunto B per ogni segmento
+
 
 def crea_cilindro(p1: np.ndarray, p2: np.ndarray, raggio: float) -> fcl.CollisionObject:
     """Crea un cilindro fisico orientato tra p1 e p2 con il raggio specificato (mm)."""
@@ -293,6 +297,123 @@ def check_collision_dynamic_frame(
     return False
 
 
+def precompute_dynamic_tensors(
+    preds_h_c: np.ndarray,
+    targets_r_c: np.ndarray,
+    W_c: np.ndarray,
+    Cov_c: np.ndarray,
+) -> dict:
+    """
+    Pre-calcola in forma vettorizzata le quantità usate dal metodo dinamico per tutti
+    i 25 frame contemporaneamente, sfruttando la disponibilità simultanea di:
+      - predizioni rete: preds_h_c (25, 15, 3)
+      - robot GT:        targets_r_c (25, 9, 3) — noto, zero data leakage
+
+    Ritorna un dict con:
+        'vel_h':    (25, 15, 3)  — velocità per giunto umano (da predizioni)
+        'vel_r':    (25, 8, 3)   — velocità per link robot (da GT)
+        'R_cp':     (25, 15)     — raggio conformal per giunto
+        'R_cp_seg': (25, 16)     — raggio conformal per segmento (max tra giunti estremi)
+        'V_rel':    (25, 16, 8)  — velocità relativa segmento×link
+    """
+    T = preds_h_c.shape[0]  # 25
+
+    # --- Velocità umane (da predizioni rete) ---
+    # Frame 0: nessun frame precedente → velocità zero
+    vel_h = np.zeros((T, 15, 3))
+    vel_h[1:] = np.diff(preds_h_c, axis=0) / FRAME_RATE_S  # (T-1, 15, 3)
+
+    # --- Velocità robot (da GT — nota, nessun data leakage) ---
+    r_centers = 0.5 * (targets_r_c[:, _CONN_ROBOT_A] + targets_r_c[:, _CONN_ROBOT_B])  # (T, 8, 3)
+    vel_r = np.zeros((T, 8, 3))
+    vel_r[1:] = np.diff(r_centers, axis=0) / FRAME_RATE_S  # (T-1, 8, 3)
+
+    # --- R_cp per giunto: sqrt(W[h,j] * lambda_max(Cov[h,j])) — SVD vettorizzata ---
+    sv_all = np.linalg.svd(Cov_c, compute_uv=False)   # (T, 15, 3)
+    lambda_max_all = sv_all[..., 0]                     # (T, 15)
+    R_cp = np.sqrt(np.maximum(W_c, 0.0) * lambda_max_all)  # (T, 15)
+
+    # --- R_cp per segmento: max tra i due giunti estremi ---
+    R_cp_seg = np.maximum(R_cp[:, _SEG_A], R_cp[:, _SEG_B])  # (T, 16)
+
+    # --- Velocità per segmento umano: media tra giunti A e B ---
+    v_seg = 0.5 * (vel_h[:, _SEG_A] + vel_h[:, _SEG_B])  # (T, 16, 3)
+
+    # --- V_rel per (frame, segmento, link_robot): broadcasting ---
+    # v_seg:  (T, 16, 3) → (T, 16, 1, 3)
+    # vel_r:  (T, 8, 3)  → (T, 1, 8, 3)
+    v_diff = v_seg[:, :, np.newaxis, :] - vel_r[:, np.newaxis, :, :]  # (T, 16, 8, 3)
+    V_rel = np.linalg.norm(v_diff, axis=-1)  # (T, 16, 8)
+
+    return {
+        'vel_h':    vel_h,
+        'vel_r':    vel_r,
+        'R_cp':     R_cp,
+        'R_cp_seg': R_cp_seg,
+        'V_rel':    V_rel,
+    }
+
+
+def check_collision_dynamic_frame_v2(
+    preds_h_frame: np.ndarray,
+    targets_r_frame: np.ndarray,
+    robot_objs: list,
+    allarme_conformal: bool,
+    m_base_mm: float,
+    tau: float,
+    R_cp_h: np.ndarray,
+    R_cp_seg_h: np.ndarray,
+    V_rel_h: np.ndarray,
+) -> bool:
+    """
+    Stage 2 — Collisione con cilindro gonfiato via soft-clipping (singolo frame),
+    versione ottimizzata con quantità pre-calcolate.
+
+    Rispetto a check_collision_dynamic_frame():
+      - Non ricalcola velocità o R_cp (già forniti da precompute_dynamic_tensors)
+      - Esegue solo le operazioni scalari/FCL strettamente necessarie
+
+    Args:
+        preds_h_frame:   (15, 3) — predizioni giunti umani al frame h
+        targets_r_frame: (9, 3)  — posizioni robot GT al frame h
+        robot_objs:      list    — oggetti FCL robot (pre-costruiti)
+        allarme_conformal: bool  — True se Stage 1 ha rilevato prossimità
+        m_base_mm:       float   — soglia base in mm
+        tau:             float   — guadagno velocità
+        R_cp_h:          (15,)   — R_cp per giunto al frame h
+        R_cp_seg_h:      (16,)   — R_cp per segmento al frame h
+        V_rel_h:         (16, 8) — velocità relativa seg×link al frame h
+    """
+    # Pre-filtro AABB: bound superiore usando R_cp massimo (R_soft <= R_cp sempre)
+    max_margin = SOGLIA_COLLISIONE + _MAX_ANAT_RADIUS + RAGGIO_ROBOT + float(R_cp_h.max())
+    if _frame_quick_reject(preds_h_frame, targets_r_frame, max_margin):
+        return False
+
+    req = fcl.DistanceRequest()
+
+    for seg_idx, (a, b) in enumerate(CONN_HUMAN):
+        r_anat = SEGMENT_RADII[(a, b)]
+
+        if allarme_conformal:
+            R_cp_seg = R_cp_seg_h[seg_idx]
+
+        for rob_idx, rob_obj in enumerate(robot_objs):
+            if allarme_conformal:
+                V_rel = V_rel_h[seg_idx, rob_idx]
+                m_t = m_base_mm + tau * V_rel
+                R_soft = m_t * np.tanh(R_cp_seg / m_t) if m_t > 1e-9 else 0.0
+                r_test = r_anat + R_soft
+            else:
+                r_test = r_anat
+
+            hum_cyl = crea_cilindro(preds_h_frame[a], preds_h_frame[b], r_test)
+            res = fcl.DistanceResult()
+            if fcl.distance(hum_cyl, rob_obj, req, res) <= SOGLIA_COLLISIONE:
+                return True
+
+    return False
+
+
 def valuta_clip(
     i: int,
     targets_h_c: np.ndarray,
@@ -313,18 +434,19 @@ def valuta_clip(
         pred_crash = check_collision_pred_conformal(preds_h_c, targets_r_c, W_c, Cov_c)
     elif mode == "dynamic":
         m_base_mm = m_base * 1000.0
+        # Pre-calcolo vettorizzato di velocità, R_cp e V_rel per tutti i 25 frame
+        precomp = precompute_dynamic_tensors(preds_h_c, targets_r_c, W_c, Cov_c)
         for h in range(25):
-            p_h_prev = preds_h_c[h - 1] if h > 0 else None
-            p_r_prev = targets_r_c[h - 1] if h > 0 else None
             # Robot objects costruiti UNA VOLTA per frame, riusati in Stage 1 e Stage 2
             robot_objs = _build_robot_objects(targets_r_c[h])
             allarme = check_collision_conformal_frame(preds_h_c[h], W_c[h], Cov_c[h], robot_objs)
-            if check_collision_dynamic_frame(
-                preds_h_c[h], p_h_prev,
-                targets_r_c[h], p_r_prev,
-                W_c[h], Cov_c[h],
+            if check_collision_dynamic_frame_v2(
+                preds_h_c[h], targets_r_c[h],
                 robot_objs, allarme,
-                m_base_mm, tau
+                m_base_mm, tau,
+                R_cp_h=precomp['R_cp'][h],
+                R_cp_seg_h=precomp['R_cp_seg'][h],
+                V_rel_h=precomp['V_rel'][h],
             ):
                 pred_crash = True
                 break
@@ -394,33 +516,39 @@ def run_fcl_evaluation(results_file: str, config: dict = None, cache_file: str =
         best_pred_collisions_np = None
 
         log.info(f"Grid search su {len(m_bases) * len(taus)} combinazioni (m_bases × taus)...")
-        for m_base in m_bases:
-            for tau in taus:
-                risultati = Parallel(n_jobs=-1, prefer="threads")(
+        grid_pairs = [(m, t) for m in m_bases for t in taus]
+        for m_base, tau in tqdm(grid_pairs, desc="      [dynamic grid]", unit="config"):
+            risultati = list(tqdm(
+                Parallel(n_jobs=-1, prefer="threads", return_as="generator")(
                     delayed(valuta_clip)(i, targets_h[i], preds_h[i], targets_r[i], W[i], Cov[i], use_cache, cache_gt, mode="dynamic", m_base=m_base, tau=tau)
                     for i in range(num_clips)
-                )
-                risultati.sort(key=lambda x: x[0])
+                ),
+                total=num_clips,
+                desc=f"        m={m_base} τ={tau}",
+                unit="clip",
+                leave=False,
+            ))
+            risultati.sort(key=lambda x: x[0])
 
-                if gt_collisions_np is None:
-                    gt_collisions_np = np.array([ris[1] for ris in risultati])
-                current_pred = np.array([ris[2] for ris in risultati])
+            if gt_collisions_np is None:
+                gt_collisions_np = np.array([ris[1] for ris in risultati])
+            current_pred = np.array([ris[2] for ris in risultati])
 
-                TP = np.sum(gt_collisions_np & current_pred)
-                FP = np.sum((~gt_collisions_np) & current_pred)
-                FN = np.sum(gt_collisions_np & (~current_pred))
-                TN = np.sum((~gt_collisions_np) & (~current_pred))
+            TP = np.sum(gt_collisions_np & current_pred)
+            FP = np.sum((~gt_collisions_np) & current_pred)
+            FN = np.sum(gt_collisions_np & (~current_pred))
+            TN = np.sum((~gt_collisions_np) & (~current_pred))
 
-                precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-                recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+            recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
-                log.info(f"[Grid] m_base={m_base}m, tau={tau}s -> TP:{TP} FP:{FP} FN:{FN} F1:{f1:.4f}")
+            log.info(f"[Grid] m_base={m_base}m, tau={tau}s -> TP:{TP} FP:{FP} FN:{FN} F1:{f1:.4f}")
 
-                if f1 >= miglior_f1:
-                    miglior_f1 = f1
-                    migliori_params = (m_base, tau)
-                    best_pred_collisions_np = current_pred.copy()
+            if f1 >= miglior_f1:
+                miglior_f1 = f1
+                migliori_params = (m_base, tau)
+                best_pred_collisions_np = current_pred.copy()
 
         log.info(f"Grid search completata. Vincitore: m_base={migliori_params[0]}m, tau={migliori_params[1]}s (F1: {miglior_f1:.4f})")
 
