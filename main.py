@@ -189,7 +189,12 @@ def run_experiment(config: dict, offline_artifacts: dict, is_batch: bool = False
     # --- FASE 4: INFERENZA SUL TEST SET ---
     log.info("=== FASE 4: INFERENZA SUL TEST SET (PARALLELA) ===")
     t_start_infer = time.time()
-    test_results_path, num_test_clips = run_test_inference(config, exp_dir, offline_artifacts)
+    # Per TabPFN i modelli non vengono salvati su disco (in-context learning: troppo spazio,
+    # troppo lento da serializzare). Li passiamo direttamente in-memory.
+    models_in_memory = trained_models if active_model == 'tabpfn' else None
+    test_results_path, num_test_clips = run_test_inference(
+        config, exp_dir, offline_artifacts, models_dict=models_in_memory
+    )
     t_infer = time.time() - t_start_infer
 
     # --- FASE 5: VALUTAZIONE COLLISIONI FCL (TEST) ---

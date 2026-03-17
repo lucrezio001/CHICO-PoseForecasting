@@ -13,6 +13,11 @@ import numpy as np
 N_JOINTS: int = 15        # Numero di giunti umani nel dataset CHICO
 N_HORIZONS: int = 25      # Frame futuri predetti (1–25)
 FRAME_RATE_MS: int = 40   # Intervallo tra frame in millisecondi (25 fps)
+FRAME_RATE_S: float = FRAME_RATE_MS / 1000.0  # Intervallo tra frame in secondi (0.04 s)
+
+# Frazione riservata al validation set interno (split deterministico sul set di calibrazione).
+# Il 95% va al training del regressore, il 5% alla valutazione FCL.
+TRAIN_VAL_SPLIT: float = 0.05
 
 # Coefficiente di mixing per la stima della covarianza locale (KNN blend)
 # sig_target = KNN_BLEND_LOCAL * sig_locale + (1 - KNN_BLEND_LOCAL) * sig_globale
@@ -92,6 +97,30 @@ def load_dataset(pkl_path: str) -> dict:
     if missing:
         raise KeyError(f"Chiavi mancanti nel dataset '{pkl_path}': {missing}")
     return data
+
+
+def validate_offline_artifacts(artifacts: dict) -> None:
+    """
+    Verifica che offline_artifacts contenga tutte le chiavi obbligatorie
+    e che la dimensione delle feature sia coerente con N_JOINTS.
+
+    Args:
+        artifacts: Dizionario prodotto da process_offline_data().
+
+    Raises:
+        KeyError:   Se mancano chiavi obbligatorie.
+        ValueError: Se la shape di X_knn_scaled non corrisponde a N_JOINTS.
+    """
+    required = {'scaler', 'ball_tree', 'storici_residui', 'sigma_global', 'X_knn_scaled'}
+    missing = required - set(artifacts.keys())
+    if missing:
+        raise KeyError(f"offline_artifacts: chiavi mancanti {missing}")
+    n_feat = artifacts['X_knn_scaled'].shape[1]
+    if n_feat != N_JOINTS:
+        raise ValueError(
+            f"X_knn_scaled ha {n_feat} colonne, atteso N_JOINTS={N_JOINTS}. "
+            "Controlla che il workspace sia compatibile con questa versione della pipeline."
+        )
 
 
 # ─── FEATURE ENGINEERING ──────────────────────────────────────────────────────

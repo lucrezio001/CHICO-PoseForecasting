@@ -3,7 +3,7 @@ import pickle
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import BallTree
-from pipeline_utils import get_logger
+from pipeline_utils import get_logger, load_dataset
 
 def compute_15_distances(targets_human: np.ndarray, targets_robot: np.ndarray) -> np.ndarray:
     """
@@ -64,8 +64,7 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
             return pickle.load(f)
 
     log.info(f"Caricamento Training Set: {train_data_path}")
-    with open(train_data_path, 'rb') as f:
-        train_data = pickle.load(f)
+    train_data = load_dataset(train_data_path)
 
     targets_h = train_data['targets_human']
     targets_r = train_data['targets_robot']
@@ -84,17 +83,24 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
 
     log.info("Calcolo tensore residui e sigma globali...")
     residui_train = targets_h - preds_h  # (N, 25, 15, 3)
-    
+    N = residui_train.shape[0]
+
     # Struttura uniforme [j][h] — uguale a nc_scores e sigma_global:
     #   storici_residui[j][h]  →  giunto PRIMO, orizzonte SECONDO
     storici_residui = {j: {h: None for h in range(1, 26)} for j in range(15)}
     sigma_global = {j: {} for j in range(15)}
 
+    # Vettorizzazione: calcola tutte le 375 matrici di covarianza (j, h) in un solo einsum.
+    # Equivalente a np.cov(residui_train[:, h-1, j, :], rowvar=False) per ogni (j, h),
+    # ma senza 375 chiamate Python separate.
+    means = residui_train.mean(axis=0)              # (25, 15, 3)
+    centered = residui_train - means[np.newaxis]     # (N, 25, 15, 3)
+    sigma_all = np.einsum('nhjp,nhjq->hjpq', centered, centered) / (N - 1)  # (25, 15, 3, 3)
+
     for j in range(15):
         for h in range(1, 26):
-            res_h = residui_train[:, h-1, j, :]
-            storici_residui[j][h] = res_h
-            sigma_global[j][h] = np.cov(res_h, rowvar=False)
+            storici_residui[j][h] = residui_train[:, h-1, j, :]
+            sigma_global[j][h] = sigma_all[h-1, j]
 
     offline_artifacts = {
         'scaler': scaler, 

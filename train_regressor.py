@@ -4,7 +4,7 @@ import pickle
 import shutil
 from sklearn.model_selection import train_test_split
 from regressor_factory import build_regressor
-from pipeline_utils import build_feature_matrix, get_logger
+from pipeline_utils import build_feature_matrix, get_logger, load_dataset, TRAIN_VAL_SPLIT
 
 JOINT_NAMES = [
     "Pelvis", "R_Hip", "R_Knee", "R_Ankle", 
@@ -38,16 +38,15 @@ def _prepare_val_data(config: dict, random_seed: int) -> dict:
     Returns:
         Dizionario con chiavi: targets_h_val, targets_r_val, preds_h_val, val_indices.
     """
-    get_logger().info("Preparazione dati validation set FCL (5% calibrazione)...")
-    with open(config['directories']['val_data'], 'rb') as f:
-        calib_data = pickle.load(f)
+    get_logger().info(f"Preparazione dati validation set FCL ({TRAIN_VAL_SPLIT*100:.0f}% calibrazione)...")
+    calib_data = load_dataset(config['directories']['val_data'])
 
     targets_h_full = calib_data['targets_human']
     targets_r_full = calib_data['targets_robot']
     preds_h_full   = calib_data['preds']
 
     indices = np.arange(targets_h_full.shape[0])
-    _, val_indices = train_test_split(indices, test_size=0.05, random_state=random_seed)
+    _, val_indices = train_test_split(indices, test_size=TRAIN_VAL_SPLIT, random_state=random_seed)
 
     return {
         'targets_h_val': targets_h_full[val_indices],
@@ -110,7 +109,7 @@ def _train_or_load_models(
     rng = np.random.default_rng(random_seed)
     all_idx = np.arange(N_clips)
     rng.shuffle(all_idx)
-    split = int(N_clips * 0.95)
+    split = int(N_clips * (1.0 - TRAIN_VAL_SPLIT))
     train_idx, val_idx_inner = all_idx[:split], all_idx[split:]
 
     val_predicted_thresholds = np.zeros((N_val, 25, 15))
@@ -168,8 +167,17 @@ def _train_or_load_models(
             val_covariances[:, h-1, joint_idx] = sigma_global[joint_idx][h_matrix]
 
     if pre_trained_models is None:
-        with open(model_path, 'wb') as f:
-            pickle.dump(models_dict, f)
+        # TabPFN memorizza i dati di training internamente (in-context learning):
+        # serializzare 375 modelli con ~4000 campioni ciascuno richiede diversi GB
+        # e il file non è riutilizzabile (predict richiede i dati di contesto).
+        # Per tutti gli altri modelli (XGB, QRF) il salvataggio è utile come cache.
+        if active_model != 'tabpfn':
+            get_logger().info(f"Salvataggio modelli addestrati in '{model_path}'...")
+            with open(model_path, 'wb') as f:
+                pickle.dump(models_dict, f)
+            get_logger().info("Salvataggio completato.")
+        else:
+            get_logger().info("TabPFN: salvataggio modelli su disco saltato (in-context, non riutilizzabile).")
 
     return (
         models_dict,

@@ -46,20 +46,17 @@ class XGBQuantileWrapper:
 
 class TabPFNQuantileWrapper:
     """
-    Wrapper TabPFN per regressione in-context.
+    Wrapper TabPFN per regressione quantile in-context.
 
     TabPFN è un modello pre-addestrato che esegue "in-context learning":
     il fit() memorizza semplicemente i dati di training, e predict() li
     usa come contesto per la predizione bayesiana.
 
-    LIMITAZIONE: TabPFNRegressor.predict() restituisce la media del posterior,
-    non il quantile specificato da alpha. target_quantile è mantenuto per
-    coerenza di interfaccia, ma non influenza il valore predetto.
+    Usa output_type="quantiles" per ottenere il quantile (1 - alpha),
+    identico al comportamento di XGBQuantileWrapper e QRF.
     """
     def __init__(self, alpha: float, device: str = 'cpu'):
         self.target_quantile = 1.0 - alpha
-        # Inizializziamo TabPFN. A differenza degli alberi, è già pre-addestrato 
-        # e fa un "in-context learning" sui dati che gli passiamo nel fit!
         self.model = TabPFNRegressor(device=device)
 
     def fit(self, X, y):
@@ -67,20 +64,12 @@ class TabPFNQuantileWrapper:
         return self
 
     def predict(self, X):
-        # ATTENZIONE: TabPFN predice la media (o la mediana) del posterior,
-        # NON il quantile self.target_quantile.
-        # Il campo target_quantile è salvato per coerenza di interfaccia, ma
-        # non viene usato internamente da TabPFNRegressor.predict().
-        # Impatto: l'ellissoide conformal risulta più conservativo del necessario
-        # per alpha < 0.5 (sovrastima dell'incertezza) e meno conservativo per alpha > 0.5.
-        # Se la versione installata di TabPFN lo supporta, si può abilitare con:
-        #   preds = self.model.predict(X, quantiles=[self.target_quantile])
-        preds = self.model.predict(X)
-        if preds.ndim > 1:
-            preds = preds[:, 0]
-        return preds
+        preds = self.model.predict(X, output_type="quantiles", quantiles=[self.target_quantile])
+        # predict() con output_type="quantiles" restituisce una lista di array,
+        # uno per ogni quantile richiesto → prendiamo il primo (e unico).
+        return preds[0]
 
-def build_regressor(config: dict):
+def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | object:
     """
     Factory: istanzia il regressore quantile specificato in config['active_model'].
 
@@ -111,7 +100,8 @@ def build_regressor(config: dict):
             n_estimators=run_cfg['n_estimators'],
             max_depth=run_cfg['max_depth'],
             random_state=random_state,
-            default_quantiles=[1.0 - alpha]
+            default_quantiles=[1.0 - alpha],
+            n_jobs=-1,
         )
     elif reg_type == 'xgb':
         return XGBQuantileWrapper(

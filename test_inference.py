@@ -5,7 +5,7 @@ from tqdm import tqdm
 from joblib import Parallel, delayed
 from data_prep import compute_15_distances
 from train_regressor import KINEMATIC_GROUPS, JOINT_NAMES
-from pipeline_utils import build_feature_matrix, KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger
+from pipeline_utils import build_feature_matrix, KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger, load_dataset, validate_offline_artifacts
 
 def compute_scores_for_joint(j, N_test, temp_strat, use_knn, storici_residui, sigma_global, test_residuals, test_neighbors):
     """
@@ -59,7 +59,12 @@ def compute_scores_for_joint(j, N_test, temp_strat, use_knn, storici_residui, si
 
     return j, scores_j, covs_j
 
-def run_test_inference(config: dict, exp_dir: str, offline_artifacts: dict) -> tuple[str, int]:
+def run_test_inference(
+    config: dict,
+    exp_dir: str,
+    offline_artifacts: dict,
+    models_dict: dict | None = None,
+) -> tuple[str, int]:
     """
     Fase 4: inferenza batch sul test set con i regressori addestrati.
 
@@ -76,6 +81,8 @@ def run_test_inference(config: dict, exp_dir: str, offline_artifacts: dict) -> t
         config:            Configurazione runtime.
         exp_dir:           Directory dell'esperimento (contiene 'trained_regressors.pkl').
         offline_artifacts: Output di process_offline_data.
+        models_dict:       Se fornito, usa questi modelli in-memory invece di caricarli
+                           da disco (utile per TabPFN, che non serializza il file pickle).
 
     Returns:
         res_path:       Percorso del file 'test_results.pkl' salvato.
@@ -86,16 +93,17 @@ def run_test_inference(config: dict, exp_dir: str, offline_artifacts: dict) -> t
 
     test_pkl = config['directories']['test_data']
     log.info(f"Caricamento test set: {test_pkl}")
-    with open(test_pkl, 'rb') as f:
-        test_data = pickle.load(f)
+    validate_offline_artifacts(offline_artifacts)
+    test_data = load_dataset(test_pkl)
 
     targets_h = test_data['targets_human']
     targets_r = test_data['targets_robot']
     preds = test_data['preds']
 
     log.info("Calcolo feature spaziali (distanze KNN) sul test set...")
-    distances = compute_15_distances(targets_h, targets_r)
-    X_knn = distances[:, 0, :] 
+    # Passa solo il frame presente (H=0): evita di allocare il tensore completo (N,25,15,R,3)
+    distances = compute_15_distances(targets_h[:, 0:1, ...], targets_r[:, 0:1, ...])
+    X_knn = distances[:, 0, :]
     scaler = offline_artifacts['scaler']
     X_test_scaled = scaler.transform(X_knn)
     N_test = X_test_scaled.shape[0]
@@ -134,9 +142,13 @@ def run_test_inference(config: dict, exp_dir: str, offline_artifacts: dict) -> t
                 
     active_model_name = config.get('active_model', 'xgb').upper()
     log.info(f"Inferenza batch con modelli {active_model_name}...")
-    model_path = os.path.join(exp_dir, 'trained_regressors.pkl')
-    with open(model_path, 'rb') as f:
-        models_dict = pickle.load(f)
+    if models_dict is None:
+        model_path = os.path.join(exp_dir, 'trained_regressors.pkl')
+        log.info(f"Caricamento modelli da disco: '{model_path}'...")
+        with open(model_path, 'rb') as f:
+            models_dict = pickle.load(f)
+    else:
+        log.info("Uso modelli passati in-memory (nessun accesso a disco).")
         
     predicted_thresholds = np.zeros((N_test, 25, 15))
     use_distances = abl_cfg.get('use_distances', True)
@@ -156,10 +168,11 @@ def run_test_inference(config: dict, exp_dir: str, offline_artifacts: dict) -> t
             predicted_thresholds[:, h-1, j] = preds_h
 
     log.info("Assemblaggio risultati finali...")
-    cov_matrix_bundle = np.zeros((N_test, 25, 15, 3, 3))
-    for j in range(15):
-        for h in range(1, 26):
-            cov_matrix_bundle[:, h-1, j, :, :] = test_covariances[j][h]
+    # (15, 25, N_test, 3, 3) → transpose → (N_test, 25, 15, 3, 3)
+    cov_matrix_bundle = np.stack(
+        [np.stack([test_covariances[j][h] for h in range(1, 26)], axis=0) for j in range(15)],
+        axis=0,
+    ).transpose(2, 1, 0, 3, 4)
             
     results_bundle = {
         'targets_human': targets_h,
