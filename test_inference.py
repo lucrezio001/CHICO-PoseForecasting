@@ -125,9 +125,10 @@ def run_test_inference(
     test_residuals = targets_h - preds
 
     log.info("Calcolo scores Mahalanobis (parallelo su 15 giunti)...")
-    # prefer='threads': numpy/BLAS rilascia il GIL durante le operazioni di algebra lineare,
-    # quindi i thread parallelizzano efficacemente senza l'overhead dei processi.
-    risultati = Parallel(n_jobs=-1, prefer="threads")(
+    # n_jobs=4: cap esplicito per non esaurire il pool thread Windows (WinError 1450)
+    # dopo una grid search lunga. Con use_knn=False (caso comune) la computazione
+    # per giunto è solo 1 SVD + Mahalanobis vettorizzato: 4 thread sono sufficienti.
+    risultati = Parallel(n_jobs=4, prefer="threads")(
         delayed(compute_scores_for_joint)(
             j, N_test, temp_strat, use_knn, storici_residui, sigma_global, test_residuals, test_neighbors
         ) for j in range(15) 
