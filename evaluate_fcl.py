@@ -619,7 +619,7 @@ def run_fcl_evaluation(results_file: str, config: dict = None, cache_file: str =
         log.info(f"Grid search su {len(taus)} valori di tau (m_base fisso a 0)...")
         for tau in tqdm(taus, desc="      [dynamic2 grid]", unit="tau"):
             risultati = list(tqdm(
-                Parallel(n_jobs=-1, prefer="threads", return_as="generator")(
+                Parallel(n_jobs=-1, return_as="generator")(
                     delayed(valuta_clip)(i, targets_h[i], preds_h[i], targets_r[i], W[i], Cov[i], use_cache, cache_gt, mode="dynamic2", m_base=0.0, tau=tau)
                     for i in range(num_clips)
                 ),
@@ -674,7 +674,7 @@ def run_fcl_evaluation(results_file: str, config: dict = None, cache_file: str =
         grid_pairs = [(m, t) for m in m_bases for t in taus]
         for m_base, tau in tqdm(grid_pairs, desc="      [dynamic grid]", unit="config"):
             risultati = list(tqdm(
-                Parallel(n_jobs=-1, prefer="threads", return_as="generator")(
+                Parallel(n_jobs=-1, return_as="generator")(
                     delayed(valuta_clip)(i, targets_h[i], preds_h[i], targets_r[i], W[i], Cov[i], use_cache, cache_gt, mode="dynamic", m_base=m_base, tau=tau)
                     for i in range(num_clips)
                 ),
