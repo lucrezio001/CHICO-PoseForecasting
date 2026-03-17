@@ -2,10 +2,11 @@ import numpy as np
 import xgboost as xgb
 from quantile_forest import RandomForestQuantileRegressor
 # Importiamo TabPFN dal tuo pacchetto
-from tabpfn import TabPFNRegressor 
+from tabpfn import TabPFNRegressor
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
+warnings.filterwarnings("ignore", category=UserWarning, module="pgbm")
 
 class XGBQuantileWrapper:
     """
@@ -84,15 +85,101 @@ class TabPFNQuantileWrapper:
             results.append(preds[0])
         return np.concatenate(results, axis=0)
 
-def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | object:
+class PGBMQuantileWrapper:
+    """
+    Wrapper PGBM (Probabilistic Gradient Boosting Machines) per regressione quantile.
+
+    PGBM fitta un singolo modello che, oltre alla predizione puntuale, stima la
+    varianza foglia-per-foglia e assume una distribuzione parametrica sull'output
+    (es. 'normal', 'lognormal', 'gamma'). I quantili si estraggono campionando
+    dalla distribuzione stimata con n_estimates campioni Monte Carlo.
+
+    Differenza chiave rispetto a XGB/QRF:
+    - XGB/QRF: minimizzano la pinball loss direttamente → precisi ma un modello per quantile
+    - PGBM: un solo fit, poi quantili via sampling → più veloce in training, dipende
+            da quanto bene la distribuzione scelta approssima i residui reali.
+
+    Per i NC scores Mahalanobis (valori positivi, asimmetrici a destra) la distribuzione
+    'lognormal' o 'gamma' è generalmente migliore di 'normal'.
+
+    Backend:
+    - device='cpu'  → pgbm.sklearn.HistGradientBoostingRegressor (sklearn-compatible)
+    - device='cuda' → pgbm.torch.PGBMRegressor (GPU, richiede CUDA >= 10.2)
+    """
+
+    def __init__(
+        self,
+        alpha: float,
+        n_estimators: int = 500,
+        distribution: str = "lognormal",
+        n_estimates: int = 1000,
+        device: str = "cpu",
+        random_state: int = 42,
+    ):
+        self.target_quantile = 1.0 - alpha
+        self.n_estimates      = n_estimates
+        self.random_state     = random_state
+        self.device           = device.lower()
+
+        if self.device in ("cuda", "gpu"):
+            # Torch backend: supporta GPU
+            from pgbm.torch import PGBMRegressor
+            self.backend = "torch"
+            self.model = PGBMRegressor(
+                n_estimators=n_estimators,
+                distribution=distribution,
+                device="gpu",
+                seed=random_state,
+                verbose=0,
+            )
+        else:
+            # Sklearn backend: CPU, sklearn-compatible
+            from pgbm.sklearn import HistGradientBoostingRegressor as PGBMSklearn
+            self.backend = "sklearn"
+            self.model = PGBMSklearn(
+                n_iter=n_estimators,
+                distribution=distribution,
+                with_variance=True,
+                random_state=random_state,
+            )
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "PGBMQuantileWrapper":
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Predice il quantile target via campionamento Monte Carlo dalla distribuzione stimata.
+
+        Returns:
+            np.ndarray shape (n_samples,) — quantile (1-alpha) per ogni campione.
+        """
+        if self.backend == "torch":
+            yhat_dist = self.model.predict_dist(X, n_forecasts=self.n_estimates)
+            # yhat_dist shape: (n_estimates, n_samples) — potrebbe essere torch.Tensor
+            if hasattr(yhat_dist, "cpu"):
+                yhat_dist = yhat_dist.cpu().numpy()
+        else:
+            yhat, yhat_std = self.model.predict(X, return_std=True)
+            yhat_dist = self.model.sample(
+                yhat, yhat_std,
+                n_estimates=self.n_estimates,
+                random_state=self.random_state,
+            )
+            # yhat_dist shape: (n_estimates, n_samples)
+
+        return np.percentile(yhat_dist, self.target_quantile * 100.0, axis=0)
+
+
+def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | PGBMQuantileWrapper | object:
     """
     Factory: istanzia il regressore quantile specificato in config['active_model'].
 
     Modelli supportati:
     - 'qrf':    RandomForestQuantileRegressor (quantile_forest) — quantile nativo.
     - 'xgb':    XGBQuantileWrapper — XGBoost con objective 'reg:quantileerror'.
-    - 'tabpfn': TabPFNQuantileWrapper — TabPFN pre-addestrato; NOTA: predice la
-                media, non il quantile target (vedi docstring del wrapper).
+    - 'tabpfn': TabPFNQuantileWrapper — TabPFN pre-addestrato in-context learning.
+    - 'pgbm':   PGBMQuantileWrapper — PGBM distribuzionale, quantile via sampling MC.
 
     Il quantile effettivo addestrato è (1 - alpha), dove alpha è il livello di
     non-copertura della conformal prediction.
@@ -132,5 +219,14 @@ def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper 
             device=run_cfg.get('device', 'cpu'),
             predict_batch_size=run_cfg.get('predict_batch_size', 2000),
         )
+    elif reg_type == 'pgbm':
+        return PGBMQuantileWrapper(
+            alpha=alpha,
+            n_estimators=run_cfg.get('n_estimators', 500),
+            distribution=run_cfg.get('distribution', 'lognormal'),
+            n_estimates=run_cfg.get('n_estimates', 1000),
+            device=run_cfg.get('device', 'cpu'),
+            random_state=random_state,
+        )
     else:
-        raise ValueError(f"Regressore '{reg_type}' non riconosciuto.")
+        raise ValueError(f"Regressore '{reg_type}' non riconosciuto. Scegli tra: qrf, xgb, tabpfn, pgbm.")

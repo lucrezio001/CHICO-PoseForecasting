@@ -36,8 +36,8 @@ def validate_config(config: dict) -> None:
 
     if mode not in ('single', 'batch'):
         errors.append(f"experiment_mode deve essere 'single' o 'batch', trovato: '{mode}'")
-    if model not in ('xgb', 'qrf', 'tabpfn'):
-        errors.append(f"active_model deve essere 'xgb', 'qrf' o 'tabpfn', trovato: '{model}'")
+    if model not in ('xgb', 'qrf', 'tabpfn', 'pgbm'):
+        errors.append(f"active_model deve essere 'xgb', 'qrf', 'tabpfn' o 'pgbm', trovato: '{model}'")
 
     # Verifica esistenza file dataset
     dirs = config.get('directories', {})
@@ -124,6 +124,15 @@ def build_exp_name(config: dict) -> str:
             f"exp_qrf_a{alpha}"
             f"_est{run_cfg['n_estimators']}"
             f"_md{run_cfg['max_depth']}"
+            f"{abl_suffix}"
+        )
+    elif active_model == 'pgbm':
+        dist = run_cfg.get('distribution', 'lognormal')
+        nest = run_cfg.get('n_estimators', 500)
+        return (
+            f"exp_pgbm_a{alpha}"
+            f"_est{nest}"
+            f"_dist{dist}"
             f"{abl_suffix}"
         )
     else:
