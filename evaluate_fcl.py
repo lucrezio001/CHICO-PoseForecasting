@@ -74,6 +74,9 @@ _CONN_ROBOT_B = np.array([b for a, b in CONN_ROBOT])
 _SEG_A = np.array([a for a, b in CONN_HUMAN])  # (16,) — indice giunto A per ogni segmento
 _SEG_B = np.array([b for a, b in CONN_HUMAN])  # (16,) — indice giunto B per ogni segmento
 
+# Margine AABB fisso per check_collision_gt(): nessuna espansione conformal.
+_GT_MAX_MARGIN = SOGLIA_COLLISIONE + _MAX_ANAT_RADIUS + RAGGIO_ROBOT
+
 
 def crea_cilindro(p1: np.ndarray, p2: np.ndarray, raggio: float) -> fcl.CollisionObject:
     """Crea un cilindro fisico orientato tra p1 e p2 con il raggio specificato (mm)."""
@@ -131,6 +134,8 @@ def check_collision_gt(pose_umano: np.ndarray, pose_robot: np.ndarray) -> bool:
     num_frames = pose_umano.shape[0]
     req, res = fcl.DistanceRequest(), fcl.DistanceResult()
     for t in range(num_frames):
+        if _frame_quick_reject(pose_umano[t], pose_robot[t], _GT_MAX_MARGIN):
+            continue
         robot_objs = [crea_cilindro(pose_robot[t, a], pose_robot[t, b], RAGGIO_ROBOT) for a, b in CONN_ROBOT]
         for (a, b) in CONN_HUMAN:
             human_obj = crea_cilindro(pose_umano[t, a], pose_umano[t, b], SEGMENT_RADII[(a, b)])
@@ -161,8 +166,15 @@ def check_collision_pred_conformal(
         True se almeno un frame/giunto genera un allarme di prossimità.
     """
     num_frames = pose_umano_pred.shape[0]
+    # Pre-calcola margini AABB per tutti i frame: conservative bound inclusa espansione conformal.
+    # SVD vettorizzata su (T, 15, 3, 3) per ottenere lambda_max senza loop Python.
+    sv_all = np.linalg.svd(Cov_clip, compute_uv=False)           # (T, 15, 3)
+    r_cp_max = np.sqrt(np.maximum(W_clip, 0.0) * sv_all[..., 0]) # (T, 15)
+    max_margins = SOGLIA_COLLISIONE + _MAX_ANAT_RADIUS + RAGGIO_ROBOT + r_cp_max.max(axis=1)  # (T,)
     req, res = fcl.DistanceRequest(), fcl.DistanceResult()
     for t in range(num_frames):
+        if _frame_quick_reject(pose_umano_pred[t], pose_robot[t], float(max_margins[t])):
+            continue
         robot_objs = [crea_cilindro(pose_robot[t, a], pose_robot[t, b], RAGGIO_ROBOT) for a, b in CONN_ROBOT]
         for j in range(15):
             s_hat = max(W_clip[t, j], 0.0)
@@ -345,12 +357,24 @@ def precompute_dynamic_tensors(
     v_diff = v_seg[:, :, np.newaxis, :] - vel_r[:, np.newaxis, :, :]  # (T, 16, 8, 3)
     V_rel = np.linalg.norm(v_diff, axis=-1)  # (T, 16, 8)
 
+    # --- Pre-filtro AABB vettorizzato per tutti i frame ---
+    # max_margin[h] è il bound superiore garantito sulla distanza di rilevamento massima.
+    # R_soft <= R_cp (proprietà tanh), quindi R_cp.max() è conservativo per Stage 2.
+    # _MAX_ANAT_RADIUS e RAGGIO_ROBOT coprono anche Stage 1 (ellissoidi conformal).
+    max_margins = SOGLIA_COLLISIONE + _MAX_ANAT_RADIUS + RAGGIO_ROBOT + R_cp.max(axis=1)  # (T,)
+    h_min = preds_h_c.min(axis=1) - max_margins[:, np.newaxis]   # (T, 3)
+    h_max = preds_h_c.max(axis=1) + max_margins[:, np.newaxis]   # (T, 3)
+    r_min = targets_r_c.min(axis=1)                               # (T, 3)
+    r_max = targets_r_c.max(axis=1)                               # (T, 3)
+    skip_frames = np.any(h_min > r_max, axis=1) | np.any(h_max < r_min, axis=1)  # (T,)
+
     return {
-        'vel_h':    vel_h,
-        'vel_r':    vel_r,
-        'R_cp':     R_cp,
-        'R_cp_seg': R_cp_seg,
-        'V_rel':    V_rel,
+        'vel_h':       vel_h,
+        'vel_r':       vel_r,
+        'R_cp':        R_cp,
+        'R_cp_seg':    R_cp_seg,
+        'V_rel':       V_rel,
+        'skip_frames': skip_frames,
     }
 
 
@@ -384,32 +408,31 @@ def check_collision_dynamic_frame_v2(
         R_cp_seg_h:      (16,)   — R_cp per segmento al frame h
         V_rel_h:         (16, 8) — velocità relativa seg×link al frame h
     """
-    # Pre-filtro AABB: bound superiore usando R_cp massimo (R_soft <= R_cp sempre)
-    max_margin = SOGLIA_COLLISIONE + _MAX_ANAT_RADIUS + RAGGIO_ROBOT + float(R_cp_h.max())
-    if _frame_quick_reject(preds_h_frame, targets_r_frame, max_margin):
-        return False
-
+    # Nota: il pre-filtro AABB per questo frame è già stato applicato in valuta_clip
+    # tramite precomp['skip_frames']. Se siamo qui, il frame non è stato scartato.
     req = fcl.DistanceRequest()
 
     for seg_idx, (a, b) in enumerate(CONN_HUMAN):
         r_anat = SEGMENT_RADII[(a, b)]
 
-        if allarme_conformal:
+        if not allarme_conformal:
+            # r_test = r_anat costante per tutti i link robot: crea il cilindro UNA VOLTA
+            hum_cyl = crea_cilindro(preds_h_frame[a], preds_h_frame[b], r_anat)
+            for rob_obj in robot_objs:
+                res = fcl.DistanceResult()
+                if fcl.distance(hum_cyl, rob_obj, req, res) <= SOGLIA_COLLISIONE:
+                    return True
+        else:
+            # r_test varia per ogni link robot (V_rel diversa): cilindro diverso per ognuno
             R_cp_seg = R_cp_seg_h[seg_idx]
-
-        for rob_idx, rob_obj in enumerate(robot_objs):
-            if allarme_conformal:
+            for rob_idx, rob_obj in enumerate(robot_objs):
                 V_rel = V_rel_h[seg_idx, rob_idx]
                 m_t = m_base_mm + tau * V_rel
                 R_soft = m_t * np.tanh(R_cp_seg / m_t) if m_t > 1e-9 else 0.0
-                r_test = r_anat + R_soft
-            else:
-                r_test = r_anat
-
-            hum_cyl = crea_cilindro(preds_h_frame[a], preds_h_frame[b], r_test)
-            res = fcl.DistanceResult()
-            if fcl.distance(hum_cyl, rob_obj, req, res) <= SOGLIA_COLLISIONE:
-                return True
+                hum_cyl = crea_cilindro(preds_h_frame[a], preds_h_frame[b], r_anat + R_soft)
+                res = fcl.DistanceResult()
+                if fcl.distance(hum_cyl, rob_obj, req, res) <= SOGLIA_COLLISIONE:
+                    return True
 
     return False
 
@@ -434,9 +457,12 @@ def valuta_clip(
         pred_crash = check_collision_pred_conformal(preds_h_c, targets_r_c, W_c, Cov_c)
     elif mode == "dynamic":
         m_base_mm = m_base * 1000.0
-        # Pre-calcolo vettorizzato di velocità, R_cp e V_rel per tutti i 25 frame
+        # Pre-calcolo vettorizzato di velocità, R_cp, V_rel e skip_frames per tutti i 25 frame
         precomp = precompute_dynamic_tensors(preds_h_c, targets_r_c, W_c, Cov_c)
         for h in range(25):
+            # Skip frame se AABB vettorizzato lo esclude (nessuna collisione possibile)
+            if precomp['skip_frames'][h]:
+                continue
             # Robot objects costruiti UNA VOLTA per frame, riusati in Stage 1 e Stage 2
             robot_objs = _build_robot_objects(targets_r_c[h])
             allarme = check_collision_conformal_frame(preds_h_c[h], W_c[h], Cov_c[h], robot_objs)
