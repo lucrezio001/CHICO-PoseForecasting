@@ -1,7 +1,7 @@
 # ==========================================
 # IMPOSTAZIONI GLOBALI
 # ==========================================
-experiment_mode: "batch" # Scegli: "single" oppure "batch"
+experiment_mode: "single" # Scegli: "single" oppure "batch"
 active_model: "tabpfn"       # Scegli: "qrf" (Random Forest) oppure "xgb" (XGBoost), "tabpfn"
 
 directories:
@@ -23,6 +23,14 @@ collision_tuning:
   mode: "standard" # Metti "standard" (ellissoidi) oppure "dynamic" (grid search cilindri gonfiati)
   m_bases: [0.03, 0.05, 0.08] # Margine di errore in metri
   taus: [0.05, 0.08, 0.1]     # Orizzonte temporale di reazione in secondi
+
+# ==========================================
+# CONTROLLO FASI PIPELINE
+# ==========================================
+pipeline_flags:
+  skip_test_inference: false  # true → esegue solo Fasi 2.5+3+3.5 (train+val, no test set)
+  collision_only: false       # true → salta tutto, riesegue solo Fase 5 su bundle esistente
+  test_bundle_path: ""        # percorso bundle test .pkl (solo con collision_only: true)
 
 # ==========================================
 # MODALITA' SINGOLA (Test veloci e Debug)
@@ -51,10 +59,10 @@ single_run:
     device: "cpu"
 
   tabpfn:
-    alpha: 0.9
+    alpha: 0.1
     device: "cuda"
-    subsample_size: 100       # Max campioni training per modello (TabPFN: limite pratico ~4000-8000)
-    predict_batch_size: 2000  # Batch inferenza: evita CUDA OOM sul test set (~61k campioni)
+    subsample_size: 200       # Max campioni training per modello (TabPFN: limite pratico ~4000-8000)
+    predict_batch_size: 7000  # Batch inferenza: evita CUDA OOM sul test set (~61k campioni)
 # ==========================================
 # MODALITA' BATCH (Addestramento Massivo Notturno)
 # ==========================================

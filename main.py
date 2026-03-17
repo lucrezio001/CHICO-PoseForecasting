@@ -128,7 +128,11 @@ def build_exp_name(config: dict) -> str:
         )
     else:
         # tabpfn e modelli futuri senza parametri albero classici
-        return f"exp_{active_model}_a{alpha}{abl_suffix}"
+        ss  = run_cfg.get('subsample_size', 0)
+        pb  = run_cfg.get('predict_batch_size', 0)
+        ss_part = f"_ss{ss}" if ss > 0 else ""
+        pb_part = f"_pb{pb}" if pb > 0 else ""
+        return f"exp_{active_model}_a{alpha}{ss_part}{pb_part}{abl_suffix}"
 
 
 def run_experiment(config: dict, offline_artifacts: dict, is_batch: bool = False) -> None:
@@ -155,16 +159,32 @@ def run_experiment(config: dict, offline_artifacts: dict, is_batch: bool = False
 
     base_dir     = config['directories']['results_base']
     active_model = config['active_model']
+    flags        = config.get('pipeline_flags', {})
+    skip_test    = flags.get('skip_test_inference', False)
+    collision_only = flags.get('collision_only', False)
 
     exp_name = build_exp_name(config)
-    
-    exp_dir = os.path.join(base_dir, "batch_experiments" if is_batch else "single_experiment", exp_name)
+    exp_dir  = os.path.join(base_dir, "batch_experiments" if is_batch else "single_experiment", exp_name)
     os.makedirs(exp_dir, exist_ok=True)
 
     log = setup_logging(exp_dir)
     log.info("=" * 50)
     log.info(f"ESPERIMENTO: {exp_name}")
     log.info("=" * 50)
+
+    # --- MODALITA' COLLISION ONLY: salta tutto, riesegue solo Fase 5 ---
+    if collision_only:
+        bundle_path = flags.get('test_bundle_path', '').strip()
+        if not bundle_path:
+            bundle_path = os.path.join(exp_dir, 'test_results_bundle.pkl')
+        if not os.path.exists(bundle_path):
+            raise FileNotFoundError(
+                f"collision_only=true ma bundle non trovato: '{bundle_path}'\n"
+                f"Imposta pipeline_flags.test_bundle_path nel config."
+            )
+        log.info(f"=== COLLISION ONLY: carico bundle da '{bundle_path}' ===")
+        run_fcl_evaluation(bundle_path, config, cache_file='gt_collisions_cache.pkl')
+        return
 
     # --- FASE 2.5: ESTRAZIONE SCORES ---
     nc_scores, cov_diagonals = process_and_save_scores(offline_artifacts, config, exp_dir)
@@ -192,20 +212,26 @@ def run_experiment(config: dict, offline_artifacts: dict, is_batch: bool = False
     if os.path.exists(old_txt):
         os.replace(old_txt, os.path.join(exp_dir, 'VAL_fcl_evaluation_results.txt'))
 
-    # --- FASE 4: INFERENZA SUL TEST SET ---
-    log.info("=== FASE 4: INFERENZA SUL TEST SET (PARALLELA) ===")
-    t_start_infer = time.time()
-    # Per TabPFN i modelli non vengono salvati su disco (in-context learning: troppo spazio,
-    # troppo lento da serializzare). Li passiamo direttamente in-memory.
-    models_in_memory = trained_models if active_model == 'tabpfn' else None
-    test_results_path, num_test_clips = run_test_inference(
-        config, exp_dir, offline_artifacts, models_dict=models_in_memory
-    )
-    t_infer = time.time() - t_start_infer
+    if skip_test:
+        log.info("=== PIPELINE FLAGS: skip_test_inference=true → Fase 4 e 5 saltate ===")
+        t_infer = 0.0
+        num_test_clips = 0
+        test_results_path = None
+    else:
+        # --- FASE 4: INFERENZA SUL TEST SET ---
+        log.info("=== FASE 4: INFERENZA SUL TEST SET (PARALLELA) ===")
+        t_start_infer = time.time()
+        # Per TabPFN i modelli non vengono salvati su disco (in-context learning: troppo spazio,
+        # troppo lento da serializzare). Li passiamo direttamente in-memory.
+        models_in_memory = trained_models if active_model == 'tabpfn' else None
+        test_results_path, num_test_clips = run_test_inference(
+            config, exp_dir, offline_artifacts, models_dict=models_in_memory
+        )
+        t_infer = time.time() - t_start_infer
 
-    # --- FASE 5: VALUTAZIONE COLLISIONI FCL (TEST) ---
-    log.info("=== FASE 5: VALUTAZIONE COLLISIONI FCL (TEST) ===")
-    run_fcl_evaluation(test_results_path, config, cache_file='gt_collisions_cache.pkl')
+        # --- FASE 5: VALUTAZIONE COLLISIONI FCL (TEST) ---
+        log.info("=== FASE 5: VALUTAZIONE COLLISIONI FCL (TEST) ===")
+        run_fcl_evaluation(test_results_path, config, cache_file='gt_collisions_cache.pkl')
 
     t_end_total = time.time()
     t_tot = t_end_total - t_start_total

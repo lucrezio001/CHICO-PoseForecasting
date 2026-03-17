@@ -123,72 +123,7 @@ def _train_or_load_models(
     active_model   = config.get('active_model', 'xgb').lower()
     subsample_size = config['current_run'].get('subsample_size', 0)
 
-    if active_model == 'tabpfn' and pre_trained_models is None:
-        # ── Option A: 1 modello per giunto (15 totali) ────────────────────────
-        # I dati di tutti e 25 gli orizzonti vengono uniti in un unico training
-        # set per giunto. L'orizzonte h è già incluso come feature scalare
-        # (use_time_feature=True), quindi il modello impara la progressione
-        # temporale senza bisogno di modelli separati per ogni h.
-        # Speedup atteso: ~25x training, ~1.4x inference (KV cache).
-        # Questa branch è SOLO per TabPFN; XGB/QRF usano il path classico sotto.
-        log = get_logger()
-        log.info("TabPFN Option A: addestramento 15 modelli pooled (1 per giunto)...")
-        N_val_inner = len(val_idx_inner)
-
-        for joint_idx in range(15):
-            log.info(f"Addestramento giunto {joint_idx} ({JOINT_NAMES[joint_idx]})...")
-            group = KINEMATIC_GROUPS[joint_idx]
-            models_dict[joint_idx] = {}
-
-            # Accumula dati da tutti e 25 gli orizzonti
-            X_parts_t, Y_parts_t = [], []
-            X_parts_v, Y_parts_v, D_parts_v = [], [], []
-            for h in range(1, 26):
-                X_h = build_feature_matrix(
-                    X_knn_scaled, h, nc_scores, group,
-                    use_distances, use_time_feature, past_window,
-                )
-                X_parts_t.append(X_h[train_idx])
-                Y_parts_t.append(nc_scores[joint_idx][h][train_idx])
-                X_parts_v.append(X_h[val_idx_inner])
-                Y_parts_v.append(nc_scores[joint_idx][h][val_idx_inner])
-                D_parts_v.append(cov_diagonals[joint_idx][h][val_idx_inner])
-
-            X_all_t = np.vstack(X_parts_t)   # (25 * N_train, n_feat)
-            Y_all_t = np.concatenate(Y_parts_t)
-
-            # Subsample stratificato: ~subsample_size/25 campioni per orizzonte
-            regressor = build_regressor(config)
-            if subsample_size > 0 and X_all_t.shape[0] > subsample_size:
-                rng_sub = np.random.default_rng(random_seed + joint_idx)
-                n_per_h  = max(1, subsample_size // 25)
-                idx_sub  = np.concatenate([
-                    rng_sub.choice(np.arange(h_i * len(train_idx), (h_i + 1) * len(train_idx)),
-                                   size=min(n_per_h, len(train_idx)), replace=False)
-                    for h_i in range(25)
-                ])
-                regressor.fit(X_all_t[idx_sub], Y_all_t[idx_sub])
-            else:
-                regressor.fit(X_all_t, Y_all_t)
-
-            models_dict[joint_idx]['pooled'] = regressor
-
-            # Predici validation per tutti gli orizzonti (KV cache: 1 predict call)
-            X_all_v = np.vstack(X_parts_v)   # (25 * N_val_inner, n_feat)
-            preds_all_v = np.maximum(regressor.predict(X_all_v), 0)
-
-            for h in range(1, 26):
-                sl = slice((h - 1) * N_val_inner, h * N_val_inner)
-                inner_val_preds[joint_idx][h]   = preds_all_v[sl]
-                inner_val_targets[joint_idx][h] = Y_parts_v[h - 1]
-                inner_val_diags[joint_idx][h]   = D_parts_v[h - 1]
-                val_predicted_thresholds[:, h-1, joint_idx] = preds_all_v[sl]
-                h_matrix = 25 if temp_strat == 'constant' else h
-                val_covariances[:, h-1, joint_idx] = sigma_global[joint_idx][h_matrix]
-
-    else:
-        # ── Path classico: 375 modelli (XGB / QRF / TabPFN pre-addestrato) ───
-        for joint_idx in range(15):
+    for joint_idx in range(15):
             if pre_trained_models is None:
                 get_logger().info(f"Addestramento giunto {joint_idx} ({JOINT_NAMES[joint_idx]})...")
             else:
@@ -213,7 +148,11 @@ def _train_or_load_models(
                     regressor = pre_trained_models[joint_idx][h]
                 else:
                     regressor = build_regressor(config)
-                    regressor.fit(X_t, Y_t)
+                    if subsample_size > 0 and X_t.shape[0] > subsample_size:
+                        idx_sub = np.random.choice(X_t.shape[0], subsample_size, replace=False)
+                        regressor.fit(X_t[idx_sub], Y_t[idx_sub])
+                    else:
+                        regressor.fit(X_t, Y_t)
 
                 models_dict[joint_idx][h] = regressor
 
