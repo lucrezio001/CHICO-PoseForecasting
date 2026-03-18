@@ -383,11 +383,12 @@ def precompute_dynamic_tensors(
     # V_rel è già la norma di v_diff, shape (T, 16, 8).
     norm_d_diff = np.linalg.norm(d_diff, axis=-1)  # (T, 16, 8)
     denom_cos = V_rel * norm_d_diff  # (T, 16, 8)
-    cos_theta = np.where(
-        denom_cos > 1e-5,
-        convergenza / denom_cos,
-        0.0
-    )
+    # Sostituisce il denominatore con 1.0 dove è ~0 prima della divisione:
+    # np.where valuta entrambi i branch, quindi dividere direttamente produce
+    # NaN/RuntimeWarning anche se poi il valore viene scartato. Usando safe_denom
+    # la divisione non è mai per zero e il warning scompare.
+    safe_denom = np.where(denom_cos > 1e-5, denom_cos, 1.0)
+    cos_theta = np.where(denom_cos > 1e-5, convergenza / safe_denom, 0.0)
     cos_theta = np.clip(cos_theta, 0.0, 1.0)  # (T, 16, 8) — negativi → 0 (si allontanano)
 
     return {
