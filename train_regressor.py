@@ -123,6 +123,13 @@ def _train_or_load_models(
     active_model   = config.get('active_model', 'xgb').lower()
     subsample_size = config['current_run'].get('subsample_size', 0)
 
+    # Modelli foundation (TabICL, TabPFN) tipicamente cachano i pesi del checkpoint
+    # a livello di classe/modulo dopo il primo caricamento: le 375 istanziazioni successive
+    # sono rapide (riferimento al cache, non ricaricamento). Il log per orizzonte è
+    # utile per monitorare il progresso durante le lunghe sessioni di training.
+    _FOUNDATION_MODELS = ('tabicl', 'tabpfn')
+    _verbose_progress  = active_model in _FOUNDATION_MODELS
+
     for joint_idx in range(15):
             if pre_trained_models is None:
                 get_logger().info(f"Addestramento giunto {joint_idx} ({JOINT_NAMES[joint_idx]})...")
@@ -153,6 +160,8 @@ def _train_or_load_models(
                         regressor.fit(X_t[idx_sub], Y_t[idx_sub])
                     else:
                         regressor.fit(X_t, Y_t)
+                    if _verbose_progress:
+                        get_logger().info(f"  h={h:02d}/25 fit OK — giunto {joint_idx:02d} ({JOINT_NAMES[joint_idx]})")
 
                 models_dict[joint_idx][h] = regressor
 
@@ -165,17 +174,19 @@ def _train_or_load_models(
                 val_covariances[:, h-1, joint_idx] = sigma_global[joint_idx][h_matrix]
 
     if pre_trained_models is None:
-        # TabPFN memorizza i dati di training internamente (in-context learning):
-        # serializzare 375 modelli con ~4000 campioni ciascuno richiede diversi GB
-        # e il file non è riutilizzabile (predict richiede i dati di contesto).
-        # Per tutti gli altri modelli (XGB, QRF) il salvataggio è utile come cache.
-        if active_model != 'tabpfn':
+        # Modelli foundation (TabPFN, TabICL) memorizzano i dati di training internamente
+        # (in-context learning): serializzare 375 modelli con migliaia di campioni ciascuno
+        # richiederebbe diversi GB e il file non sarebbe riutilizzabile tra run diversi
+        # (predict richiede sempre i dati di contesto originali).
+        # Per tutti gli altri modelli (XGB, QRF, LGBM, RealMLP) il salvataggio è cache utile.
+        _NO_SAVE_MODELS = ('tabpfn', 'tabicl')
+        if active_model not in _NO_SAVE_MODELS:
             get_logger().info(f"Salvataggio modelli addestrati in '{model_path}'...")
             with open(model_path, 'wb') as f:
                 pickle.dump(models_dict, f)
             get_logger().info("Salvataggio completato.")
         else:
-            get_logger().info("TabPFN: salvataggio modelli su disco saltato (in-context, non riutilizzabile).")
+            get_logger().info(f"{active_model.upper()}: salvataggio su disco saltato (in-context, dati di contesto non serializzabili).")
 
     return (
         models_dict,
