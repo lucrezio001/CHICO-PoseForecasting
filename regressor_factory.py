@@ -1,12 +1,11 @@
 import numpy as np
 import xgboost as xgb
 from quantile_forest import RandomForestQuantileRegressor
-# Importiamo TabPFN dal tuo pacchetto
 from tabpfn import TabPFNRegressor
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
-warnings.filterwarnings("ignore", category=UserWarning, module="pgbm")
+warnings.filterwarnings("ignore", category=UserWarning, module="pytabkit")
 
 class XGBQuantileWrapper:
     """
@@ -85,101 +84,109 @@ class TabPFNQuantileWrapper:
             results.append(preds[0])
         return np.concatenate(results, axis=0)
 
-class PGBMQuantileWrapper:
+class LGBMQuantileWrapper:
     """
-    Wrapper PGBM (Probabilistic Gradient Boosting Machines) per regressione quantile.
+    Wrapper LightGBM per regressione quantile.
 
-    PGBM fitta un singolo modello che, oltre alla predizione puntuale, stima la
-    varianza foglia-per-foglia e assume una distribuzione parametrica sull'output
-    (es. 'normal', 'lognormal', 'gamma'). I quantili si estraggono campionando
-    dalla distribuzione stimata con n_estimates campioni Monte Carlo.
-
-    Differenza chiave rispetto a XGB/QRF:
-    - XGB/QRF: minimizzano la pinball loss direttamente → precisi ma un modello per quantile
-    - PGBM: un solo fit, poi quantili via sampling → più veloce in training, dipende
-            da quanto bene la distribuzione scelta approssima i residui reali.
-
-    Per i NC scores Mahalanobis (valori positivi, asimmetrici a destra) la distribuzione
-    'lognormal' o 'gamma' è generalmente migliore di 'normal'.
-
-    Backend:
-    - device='cpu'  → pgbm.sklearn.HistGradientBoostingRegressor (sklearn-compatible)
-    - device='cuda' → pgbm.torch.PGBMRegressor (GPU, richiede CUDA >= 10.2)
+    Usa l'objective 'quantile' di LightGBM per stimare il quantile (1-alpha).
+    Vantaggi rispetto a XGB: spesso più veloce su CPU, ottimo per dataset medi.
+    Non richiede GPU ma scala bene su tutti i core CPU disponibili.
     """
 
     def __init__(
         self,
         alpha: float,
-        n_estimators: int = 500,
-        distribution: str = "lognormal",
-        n_estimates: int = 1000,
-        device: str = "cpu",
+        n_estimators: int = 100,
+        num_leaves: int = 31,
+        max_depth: int = -1,
+        learning_rate: float = 0.1,
         random_state: int = 42,
     ):
+        import lightgbm as lgb
         self.target_quantile = 1.0 - alpha
-        self.n_estimates      = n_estimates
-        self.random_state     = random_state
-        self.device           = device.lower()
+        self.model = lgb.LGBMRegressor(
+            objective="quantile",
+            alpha=self.target_quantile,
+            n_estimators=n_estimators,
+            num_leaves=num_leaves,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            random_state=random_state,
+            n_jobs=-1,
+            verbose=-1,
+        )
 
-        if self.device in ("cuda", "gpu"):
-            # Torch backend: supporta GPU
-            from pgbm.torch import PGBMRegressor
-            self.backend = "torch"
-            self.model = PGBMRegressor(
-                n_estimators=n_estimators,
-                distribution=distribution,
-                device="gpu",
-                seed=random_state,
-                verbose=0,
-            )
-        else:
-            # Sklearn backend: CPU, sklearn-compatible
-            from pgbm.sklearn import HistGradientBoostingRegressor as PGBMSklearn
-            self.backend = "sklearn"
-            self.model = PGBMSklearn(
-                n_iter=n_estimators,
-                distribution=distribution,
-                with_variance=True,
-                random_state=random_state,
-            )
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "PGBMQuantileWrapper":
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "LGBMQuantileWrapper":
         self.model.fit(X, y)
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
-        Predice il quantile target via campionamento Monte Carlo dalla distribuzione stimata.
-
         Returns:
             np.ndarray shape (n_samples,) — quantile (1-alpha) per ogni campione.
         """
-        if self.backend == "torch":
-            yhat_dist = self.model.predict_dist(X, n_forecasts=self.n_estimates)
-            # yhat_dist shape: (n_estimates, n_samples) — potrebbe essere torch.Tensor
-            if hasattr(yhat_dist, "cpu"):
-                yhat_dist = yhat_dist.cpu().numpy()
+        return self.model.predict(X).ravel()
+
+
+class RealMLPQuantileWrapper:
+    """
+    Wrapper RealMLP (pytabkit) per regressione quantile tramite pinball loss.
+
+    Supporta due varianti:
+    - 'td'  : RealMLP_TD_Regressor  — rete completa, più espressiva, ~7-8 ore/375 modelli
+    - 'td_s': RealMLP_TD_S_Regressor — rete piccola, più veloce,    ~1-2 ore/375 modelli
+
+    Il parametro n_epochs limita il numero massimo di epoche (default libreria: 256).
+    Ridurre a 50-100 velocizza significativamente senza perdita grave di accuratezza.
+    """
+
+    def __init__(
+        self,
+        alpha: float,
+        device: str = "cpu",
+        random_state: int = 42,
+        variant: str = "td_s",
+        n_epochs: int | None = 64,
+    ):
+        self.target_quantile = 1.0 - alpha
+        kwargs = dict(
+            train_metric_name=f"pinball({self.target_quantile:.4f})",
+            device=device,
+            random_state=random_state,
+        )
+        if n_epochs is not None:
+            kwargs["n_epochs"] = n_epochs
+
+        if variant == "td_s":
+            from pytabkit import RealMLP_TD_S_Regressor
+            self.model = RealMLP_TD_S_Regressor(**kwargs)
         else:
-            yhat, yhat_std = self.model.predict(X, return_std=True)
-            yhat_dist = self.model.sample(
-                yhat, yhat_std,
-                n_estimates=self.n_estimates,
-                random_state=self.random_state,
-            )
-            # yhat_dist shape: (n_estimates, n_samples)
+            from pytabkit import RealMLP_TD_Regressor
+            self.model = RealMLP_TD_Regressor(**kwargs)
 
-        return np.percentile(yhat_dist, self.target_quantile * 100.0, axis=0)
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "RealMLPQuantileWrapper":
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Returns:
+            np.ndarray shape (n_samples,) — quantile (1-alpha) per ogni campione.
+        """
+        return self.model.predict(X).ravel()
 
 
-def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | PGBMQuantileWrapper | object:
+def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | LGBMQuantileWrapper | RealMLPQuantileWrapper | object:
     """
     Factory: istanzia il regressore quantile specificato in config['active_model'].
 
     Modelli supportati:
-    - 'qrf':    RandomForestQuantileRegressor (quantile_forest) — quantile nativo.
-    - 'xgb':    XGBQuantileWrapper — XGBoost con objective 'reg:quantileerror'.
-    - 'tabpfn': TabPFNQuantileWrapper — TabPFN pre-addestrato in-context learning.
-    - 'pgbm':   PGBMQuantileWrapper — PGBM distribuzionale, quantile via sampling MC.
+    - 'qrf':      RandomForestQuantileRegressor (quantile_forest) — quantile nativo.
+    - 'xgb':      XGBQuantileWrapper — XGBoost con objective 'reg:quantileerror'.
+    - 'tabpfn':   TabPFNQuantileWrapper — TabPFN pre-addestrato in-context learning.
+    - 'lgbm':     LGBMQuantileWrapper — LightGBM con objective 'quantile'. CPU-only, veloce.
+    - 'realmlp':  RealMLPQuantileWrapper — RealMLP_TD (pytabkit) con pinball loss.
+    - 'realmlp_s':RealMLPQuantileWrapper — RealMLP_TD_S (small, più veloce) con pinball loss.
 
     Il quantile effettivo addestrato è (1 - alpha), dove alpha è il livello di
     non-copertura della conformal prediction.
@@ -219,14 +226,22 @@ def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper 
             device=run_cfg.get('device', 'cpu'),
             predict_batch_size=run_cfg.get('predict_batch_size', 2000),
         )
-    elif reg_type == 'pgbm':
-        return PGBMQuantileWrapper(
+    elif reg_type == 'lgbm':
+        return LGBMQuantileWrapper(
             alpha=alpha,
-            n_estimators=run_cfg.get('n_estimators', 500),
-            distribution=run_cfg.get('distribution', 'lognormal'),
-            n_estimates=run_cfg.get('n_estimates', 1000),
-            device=run_cfg.get('device', 'cpu'),
+            n_estimators=run_cfg.get('n_estimators', 100),
+            num_leaves=run_cfg.get('num_leaves', 31),
+            max_depth=run_cfg.get('max_depth', -1),
+            learning_rate=run_cfg.get('learning_rate', 0.1),
             random_state=random_state,
         )
+    elif reg_type in ('realmlp', 'realmlp_s'):
+        return RealMLPQuantileWrapper(
+            alpha=alpha,
+            device=run_cfg.get('device', 'cpu'),
+            random_state=random_state,
+            variant='td_s' if reg_type == 'realmlp_s' else 'td',
+            n_epochs=run_cfg.get('n_epochs', 64),
+        )
     else:
-        raise ValueError(f"Regressore '{reg_type}' non riconosciuto. Scegli tra: qrf, xgb, tabpfn, pgbm.")
+        raise ValueError(f"Regressore '{reg_type}' non riconosciuto. Scegli tra: qrf, xgb, tabpfn, lgbm, realmlp, realmlp_s.")

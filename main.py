@@ -7,6 +7,17 @@ import copy
 import pickle
 import gc
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# Workaround: PyTorch 2.10+cu130 + PyTorch Lightning 2.6 hanno un bug di compatibilità
+# su get_float32_matmul_precision() con API miste (legacy + new).
+# Sopprimiamo il check di Lightning che lancia errore: non influenza le prestazioni.
+try:
+    import lightning_fabric.accelerators.cuda as _lf_cuda
+    _lf_cuda._check_cuda_matmul_precision = lambda *args, **kwargs: None
+except Exception:
+    pass
+
 from data_prep import process_offline_data
 from score_extraction import process_and_save_scores
 from train_regressor import train_phase3
@@ -36,8 +47,8 @@ def validate_config(config: dict) -> None:
 
     if mode not in ('single', 'batch'):
         errors.append(f"experiment_mode deve essere 'single' o 'batch', trovato: '{mode}'")
-    if model not in ('xgb', 'qrf', 'tabpfn', 'pgbm'):
-        errors.append(f"active_model deve essere 'xgb', 'qrf', 'tabpfn' o 'pgbm', trovato: '{model}'")
+    if model not in ('xgb', 'qrf', 'tabpfn', 'lgbm', 'realmlp', 'realmlp_s'):
+        errors.append(f"active_model deve essere 'xgb', 'qrf', 'tabpfn', 'lgbm', 'realmlp' o 'realmlp_s', trovato: '{model}'")
 
     # Verifica esistenza file dataset
     dirs = config.get('directories', {})
@@ -126,17 +137,20 @@ def build_exp_name(config: dict) -> str:
             f"_md{run_cfg['max_depth']}"
             f"{abl_suffix}"
         )
-    elif active_model == 'pgbm':
-        dist = run_cfg.get('distribution', 'lognormal')
-        nest = run_cfg.get('n_estimators', 500)
+    elif active_model == 'lgbm':
         return (
-            f"exp_pgbm_a{alpha}"
-            f"_est{nest}"
-            f"_dist{dist}"
+            f"exp_lgbm_a{alpha}"
+            f"_est{run_cfg.get('n_estimators', 100)}"
+            f"_nl{run_cfg.get('num_leaves', 31)}"
+            f"_lr{run_cfg.get('learning_rate', 0.1)}"
             f"{abl_suffix}"
         )
+    elif active_model in ('realmlp', 'realmlp_s'):
+        ep = run_cfg.get('n_epochs', 64)
+        ep_part = f"_ep{ep}" if ep is not None else ""
+        return f"exp_{active_model}_a{alpha}{ep_part}{abl_suffix}"
     else:
-        # tabpfn e modelli futuri senza parametri albero classici
+        # tabpfn e modelli futuri con subsample/batch params
         ss  = run_cfg.get('subsample_size', 0)
         pb  = run_cfg.get('predict_batch_size', 0)
         ss_part = f"_ss{ss}" if ss > 0 else ""

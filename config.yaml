@@ -1,8 +1,8 @@
 # ==========================================
 # IMPOSTAZIONI GLOBALI
 # ==========================================
-experiment_mode: "single" # Scegli: "single" oppure "batch"
-active_model: "xgb"       # Scegli: "qrf" (Random Forest) oppure "xgb" (XGBoost), "tabpfn"
+experiment_mode: "batch" # Scegli: "single" oppure "batch"
+active_model: "realmlp"    # Scegli: "qrf" / "xgb" / "tabpfn" / "realmlp"
 
 directories:
   val_data: "chico_calib_extraction.pkl"
@@ -20,7 +20,7 @@ model_params:
 # ==========================================
 
 collision_tuning:
-  mode: "dynamic2" # Metti "standard" (ellissoidi) oppure "dynamic" (grid search cilindri gonfiati)
+  mode: "standard" # Metti "standard" (ellissoidi) oppure "dynamic" (grid search cilindri gonfiati), dynamic2
   m_bases: [0.03, 0.05, 0.08] # Margine di errore in metri
   taus: [0.03, 0.05]     # Orizzonte temporale di reazione in secondi
 
@@ -64,13 +64,22 @@ single_run:
     subsample_size: 200       # Max campioni training per modello (TabPFN: limite pratico ~4000-8000)
     predict_batch_size: 7000  # Batch inferenza: evita CUDA OOM sul test set (~61k campioni)
 
-  pgbm:
+  lgbm:
     alpha: 0.9
-    n_estimators: 500
-    distribution: "lognormal"  # Distribuzione output: normal/lognormal/gamma/laplace/...
-                                # lognormal consigliata: NC scores sono positivi e asimmetrici
-    n_estimates: 1000          # Campioni Monte Carlo per estrarre il quantile
-    device: "cpu"              # "cpu" → sklearn backend | "cuda" → torch backend (GPU)
+    n_estimators: 200
+    num_leaves: 31
+    max_depth: -1               # -1 = nessun limite
+    learning_rate: 0.1
+
+  realmlp:
+    alpha: 0.9
+    device: "cuda"
+    n_epochs: 64                # Limita epoche (default libreria: 256 → troppo lento)
+
+  realmlp_s:
+    alpha: 0.9
+    device: "cuda"
+    n_epochs: 64                # Rete piccola + 64 epoch → ~1-2 ore/375 modelli
 
 # ==========================================
 # MODALITA' BATCH (Addestramento Massivo Notturno)
@@ -81,7 +90,7 @@ batch_run:
     temporal_strategy: ["per_horizon"]
     use_distances: [true]
     use_time_feature: [true]
-    past_window: [2, 5, 10, 25]
+    past_window: [5]
 
   qrf:
     alpha: [0.05, 0.1]
@@ -104,9 +113,19 @@ batch_run:
     subsample_size: [1000, 3000, 6000]        # Max campioni training per modello; 0 = nessun subsample
     predict_batch_size: [4000]    # Batch inferenza; 0 = nessun batching
 
-  pgbm:
+  lgbm:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-    n_estimators: [300, 500]
-    distribution: ["lognormal", "normal", "gamma"]
-    n_estimates: [1000]
-    device: ["cpu"]
+    n_estimators: [100, 200]
+    num_leaves: [31, 63]
+    max_depth: [-1]
+    learning_rate: [0.1]
+
+  realmlp:
+    alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    device: ["cuda"]
+    n_epochs: [64]
+
+  realmlp_s:
+    alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    device: ["cuda"]
+    n_epochs: [64]
