@@ -1,53 +1,98 @@
 # ==========================================
 # IMPOSTAZIONI GLOBALI
 # ==========================================
-experiment_mode: "batch" # Scegli: "single" oppure "batch"
-active_model: "realmlp"    # Scegli: "qrf" / "xgb" / "tabpfn" / "realmlp"
+# experiment_mode: "single" → esegue 1 esperimento con i parametri di single_run
+#                  "batch"  → esegue tutte le combinazioni di batch_run (prodotto cartesiano)
+experiment_mode: "batch"
+
+# active_model: quale regressore quantile usare
+#   "xgb"      → XGBoost         (GPU, ~5 min/375 modelli, stabile, raccomandato produzione)
+#   "qrf"      → Random Forest   (CPU, ~10 min/375 modelli, quantile nativo)
+#   "lgbm"     → LightGBM        (CPU, ~3-5 min/375 modelli, spesso più veloce di XGB su CPU)
+#   "tabpfn"   → TabPFN          (GPU, ~45 min training + ~8 ore inferenza, in-context learning)
+#   "tabicl"   → TabICLv2        (GPU auto, ~mins training + ~45 min inferenza, zero-shot foundation model)
+#   "realmlp"  → RealMLP_TD      (GPU, ~3-4 ore/375 modelli, rete grande pytabkit)
+#   "realmlp_s"→ RealMLP_TD_S    (GPU, ~1-2 ore/375 modelli, rete piccola pytabkit)
+active_model: "lgbm"
 
 directories:
-  val_data: "chico_calib_extraction.pkl"
-  test_data: "chico_extraction.pkl"
-  results_base: "risultati"
+  val_data: "chico_calib_extraction.pkl"   # dataset calibrazione (~433 MB, ~8400 clip)
+  test_data: "chico_extraction.pkl"        # dataset test (~879 MB, ~61034 clip)
+  results_base: "risultati"               # cartella output esperimenti
 
 model_params:
-  n_joints: 15
-  random_state: 42
-  k_neighbors: 1000
+  n_joints: 15          # fisso: 15 giunti CHICO
+  random_state: 42      # seed globale per riproducibilità
+  k_neighbors: 1000     # vicini KNN per BallTree (usato solo se use_knn_matrices: true)
 
 
 # ==========================================
 # TUNING COLLISIONI (Metodo Dinamico vs Standard)
 # ==========================================
-
 collision_tuning:
-  mode: "standard" # Metti "standard" (ellissoidi) oppure "dynamic" (grid search cilindri gonfiati), dynamic2
-  m_bases: [0.03, 0.05, 0.08] # Margine di errore in metri
-  taus: [0.03, 0.05]     # Orizzonte temporale di reazione in secondi
+  # mode: "standard"  → Stage 1 ellissoidi + Stage 2 cilindro gonfiato (Catoni-Giulini)
+  #        "dynamic"  → grid search su m_bases e taus (usa Stage 2 dinamico)
+  #        "dynamic2" → variante dynamic con logica alternativa
+  mode: "standard"
+  m_bases: [0.03, 0.05, 0.08]  # margine base (metri) per soft-clipping dinamico
+  taus: [0.03, 0.05]           # fattore scala velocità relativa per R_soft
 
 # ==========================================
 # CONTROLLO FASI PIPELINE
 # ==========================================
 pipeline_flags:
-  skip_test_inference: false  # true → esegue solo Fasi 2.5+3+3.5 (train+val, no test set)
-  collision_only: false       # true → salta tutto, riesegue solo Fase 5 su bundle esistente
-  test_bundle_path: ""        # percorso bundle test .pkl (solo con collision_only: true)
+  # skip_test_inference: true  → esegue solo Fasi 1+2+2.5+3+3.5 (train+val FCL, salta test set)
+  #                     false → pipeline completa inclusa inferenza test set
+  skip_test_inference: false
+
+  # collision_only: true  → salta training/inferenza, riesegue solo Fase 5 (FCL su bundle esistente)
+  #                false  → pipeline completa
+  collision_only: false
+
+  # test_bundle_path: percorso al bundle .pkl salvato da una run precedente
+  #   (usato solo con collision_only: true, lascia "" per autodetect nella exp_dir)
+  test_bundle_path: ""
 
 # ==========================================
 # MODALITA' SINGOLA (Test veloci e Debug)
 # ==========================================
 single_run:
   ablation:
+    # use_knn_matrices: true  → usa distanze KNN come feature aggiuntive (richiede BallTree)
+    #                  false  → solo distanze dirette giunto-robot (più veloce)
     use_knn_matrices: false
-    temporal_strategy: "per_horizon" # "per_horizon" o "constant"
+
+    # temporal_strategy: "per_horizon" → 1 modello per (giunto, orizzonte) = 375 modelli totali
+    #                    "constant"    → usa covarianza a h=25 per tutti gli orizzonti
+    temporal_strategy: "per_horizon"
+
+    # use_distances: true  → include le 15 distanze giunto-robot come feature di input
     use_distances: true
+
+    # use_time_feature: true → include h/25 (orizzonte normalizzato) come feature
     use_time_feature: true
+
+    # past_window: numero di score passati da includere come feature (lookback)
+    #   valori tipici: 2, 5, 10, 25
     past_window: 5
-    
+
+  # --- QRF (Quantile Random Forest) ---
+  # alpha: livello di non-copertura → quantile addestrato = 1-alpha
+  #   es. alpha=0.9 → predice il 90° percentile degli score NC
+  # n_estimators: numero di alberi (15-50 per test rapido, 100-500 per produzione)
+  # max_depth: profondità massima alberi (3-6 tipicamente)
   qrf:
     alpha: 0.1
     n_estimators: 15
     max_depth: 3
-    
+
+  # --- XGBoost ---
+  # alpha, n_estimators, max_depth: vedi QRF
+  # learning_rate: step size (0.05-0.3 tipicamente)
+  # subsample: frazione campioni per albero (0.5-1.0)
+  # colsample_bytree: frazione feature per albero (0.5-1.0)
+  # min_child_weight: peso minimo nodo foglia (regolarizzazione, 1-10)
+  # device: "cuda" → GPU XGBoost, "cpu" → CPU
   xgb:
     alpha: 0.9
     n_estimators: 200
@@ -58,49 +103,78 @@ single_run:
     min_child_weight: 3
     device: "cuda"
 
+  # --- TabPFN (in-context learning, no training classico) ---
+  # alpha: vedi QRF
+  # device: "cuda" / "cpu"
+  # subsample_size: max campioni training passati come contesto (limite pratico 2000-8000)
+  #   con >8000 campioni → CUDA OOM su 16GB VRAM; default sicuro: 2000-4000
+  # predict_batch_size: suddivide il test set in batch per evitare OOM
+  #   con 61k campioni e N_train=4000 → usa 2000-7000
   tabpfn:
     alpha: 0.1
     device: "cuda"
-    subsample_size: 200       # Max campioni training per modello (TabPFN: limite pratico ~4000-8000)
-    predict_batch_size: 7000  # Batch inferenza: evita CUDA OOM sul test set (~61k campioni)
+    subsample_size: 200
+    predict_batch_size: 7000
 
+  # --- TabICLv2 (foundation model zero-shot) ---
+  # alpha: vedi QRF
+  # device: null → auto-detect GPU (raccomandato); "cuda" / "cpu" per forzare
+  # predict_batch_size: batch inferenza test set (TabICLv2 regge batch più grandi di TabPFN)
+  #   Il checkpoint viene scaricato da HuggingFace (jingang/TabICL) al primo utilizzo
   tabicl:
     alpha: 0.9
-    device: null              # null = auto-detect GPU (raccomandato)
-    predict_batch_size: 4000  # Batch inferenza (TabICLv2 è 10x più veloce di TabPFN)
+    device: null
+    predict_batch_size: 4000
 
+  # --- LightGBM ---
+  # alpha, learning_rate: vedi XGB
+  # n_estimators: numero boosting rounds
+  # num_leaves: complessità albero (31=default, 63=più espressivo, 127=molto espressivo)
+  # max_depth: -1 = nessun limite (controllato indirettamente da num_leaves)
   lgbm:
     alpha: 0.9
     n_estimators: 200
     num_leaves: 31
-    max_depth: -1               # -1 = nessun limite
+    max_depth: -1
     learning_rate: 0.1
 
+  # --- RealMLP_TD (rete neurale pytabkit, variante grande) ---
+  # alpha: vedi QRF
+  # device: "cuda" / "cpu"
+  # n_epochs: max epoche training (default libreria: 256 → ~7-8 ore/375 modelli)
+  #   64 epoche → ~3-4 ore; 32 → ~1.5-2 ore
   realmlp:
     alpha: 0.9
     device: "cuda"
-    n_epochs: 64                # Limita epoche (default libreria: 256 → troppo lento)
+    n_epochs: 64
 
+  # --- RealMLP_TD_S (rete neurale pytabkit, variante piccola) ---
+  # Stesso di realmlp ma con architettura ridotta → ~2x più veloce
+  # 64 epoche → ~1-2 ore/375 modelli
   realmlp_s:
     alpha: 0.9
     device: "cuda"
-    n_epochs: 64                # Rete piccola + 64 epoch → ~1-2 ore/375 modelli
+    n_epochs: 64
 
 # ==========================================
 # MODALITA' BATCH (Addestramento Massivo Notturno)
 # ==========================================
+# Ogni parametro DEVE essere una lista (anche con 1 solo valore).
+# Il framework genera il prodotto cartesiano di tutti i valori → N esperimenti totali.
+# Es. alpha: [0.1, 0.9] × n_estimators: [100, 200] = 4 esperimenti
 batch_run:
   ablation:
     use_knn_matrices: [false]
     temporal_strategy: ["per_horizon"]
     use_distances: [true]
     use_time_feature: [true]
-    past_window: [5]
+    past_window: [5]          # prova [2, 5, 10, 25] per ablation completa
 
   qrf:
     alpha: [0.05, 0.1]
     n_estimators: [15, 50]
     max_depth: [3, 5]
+    # totale: 2×2×2 = 8 combinazioni
 
   xgb:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -111,17 +185,20 @@ batch_run:
     colsample_bytree: [0.9]
     min_child_weight: [3]
     device: ["cuda"]
+    # totale: 9×3 = 27 combinazioni
 
   tabpfn:
-    alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]  # deve essere lista per itertools.product nel batch mode
+    alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     device: ["cuda"]
-    subsample_size: [1000, 3000, 6000]        # Max campioni training per modello; 0 = nessun subsample
-    predict_batch_size: [4000]    # Batch inferenza; 0 = nessun batching
+    subsample_size: [1000, 3000, 6000]
+    predict_batch_size: [4000]
+    # totale: 9×3 = 27 combinazioni (~7+ ore ciascuna, usare con parsimonia)
 
   tabicl:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-    device: [null]              # null = auto-detect GPU
+    device: [null]
     predict_batch_size: [4000]
+    # totale: 9 combinazioni (~45 min ciascuna)
 
   lgbm:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -129,13 +206,16 @@ batch_run:
     num_leaves: [31, 63]
     max_depth: [-1]
     learning_rate: [0.1]
+    # totale: 9×2×2 = 36 combinazioni (~3-5 min ciascuna → ~2-3 ore totali)
 
   realmlp:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     device: ["cuda"]
     n_epochs: [64]
+    # totale: 9 combinazioni (~3-4 ore ciascuna → usare solo per confronto)
 
   realmlp_s:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     device: ["cuda"]
     n_epochs: [64]
+    # totale: 9 combinazioni (~1-2 ore ciascuna → ~9-18 ore totali)
