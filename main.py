@@ -332,17 +332,29 @@ def main() -> None:
 
     validate_config(config)
 
-    offline_dir = os.path.join(config['directories']['results_base'], 'offline_workspace')
-    offline_artifacts = process_offline_data(config['directories']['val_data'], offline_dir)
-
+    offline_dir  = os.path.join(config['directories']['results_base'], 'offline_workspace')
+    val_data_path = config['directories']['val_data']
     mode         = config.get('experiment_mode', 'single')
     active_model = config.get('active_model', 'xgb')
+
+    # --- Pre-calcolo workspace: un file per ogni valore unico di use_velocity_features ---
+    # In batch mode, use_velocity_features può essere [true, false] → 2 workspace.
+    # Ogni workspace è cached su disco; se già presente viene caricato in <1s.
+    if mode == 'single':
+        vel_values = {config['single_run']['ablation'].get('use_velocity_features', True)}
+    else:
+        vel_values = set(config['batch_run']['ablation'].get('use_velocity_features', [True]))
+
+    workspace_cache: dict[bool, dict] = {}
+    for vel_flag in vel_values:
+        workspace_cache[vel_flag] = process_offline_data(val_data_path, offline_dir, use_velocity_features=vel_flag)
 
     if mode == 'single':
         run_config = copy.deepcopy(config)
         run_config['ablation']    = config['single_run']['ablation']
         run_config['current_run'] = config['single_run'][active_model]
-        run_experiment(run_config, offline_artifacts, is_batch=False)
+        vel_flag = run_config['ablation'].get('use_velocity_features', True)
+        run_experiment(run_config, workspace_cache[vel_flag], is_batch=False)
 
     elif mode == 'batch':
         b = config['batch_run']
@@ -365,10 +377,11 @@ def main() -> None:
             combo_dict = dict(zip(all_keys, combo))
 
             run_config = copy.deepcopy(config)
-            run_config['ablation'] = {k: combo_dict[k] for k in abl_keys}
+            run_config['ablation']    = {k: combo_dict[k] for k in abl_keys}
             run_config['current_run'] = {k: combo_dict[k] for k in mod_keys}
 
-            run_experiment(run_config, offline_artifacts, is_batch=True)
+            vel_flag = run_config['ablation'].get('use_velocity_features', True)
+            run_experiment(run_config, workspace_cache[vel_flag], is_batch=True)
 
 if __name__ == "__main__":
     main()

@@ -23,7 +23,7 @@ directories:
 model_params:
   n_joints: 15          # fisso: 15 giunti CHICO
   random_state: 42      # seed globale per riproducibilità
-  k_neighbors: 1000     # vicini KNN per BallTree (usato solo se use_knn_matrices: true)
+  k_neighbors: 1000     # vicini KNN per torch.cdist (usato solo se use_knn_matrices: true)
 
 
 # ==========================================
@@ -93,11 +93,17 @@ single_run:
     #                  false  → solo distanze dirette giunto-robot (più veloce)
     use_knn_matrices: false
 
+    # use_velocity_features: true  → feature KNN = 38D (15 dist + 15 vel umano + 8 vel robot)
+    #                        false → feature KNN = 15D (solo distanze, compatibile con workspace vecchi)
+    # ATTENZIONE: cambiare questo valore genera un workspace separato (offline_workspace_vel.pkl
+    # oppure offline_workspace.pkl). Se il workspace non esiste viene ricalcolato automaticamente.
+    use_velocity_features: true
+
     # temporal_strategy: "per_horizon" → 1 modello per (giunto, orizzonte) = 375 modelli totali
     #                    "constant"    → usa covarianza a h=25 per tutti gli orizzonti
     temporal_strategy: "per_horizon"
 
-    # use_distances: true  → include le 15 distanze giunto-robot come feature di input
+    # use_distances: true  → include le feature KNN scalate come input del regressore
     use_distances: true
 
     # use_time_feature: true → include h/25 (orizzonte normalizzato) come feature
@@ -201,6 +207,7 @@ single_run:
 batch_run:
   ablation:
     use_knn_matrices: [false]
+    use_velocity_features: [true]   # aggiungi false per ablation vel vs no-vel (workspace separati)
     temporal_strategy: ["per_horizon"]
     use_distances: [true]
     use_time_feature: [true]

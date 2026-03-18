@@ -82,7 +82,7 @@ def compute_knn_features(
     return np.concatenate([distances, vel_h_norm, vel_r_norm], axis=1).astype(np.float32)
 
 
-def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
+def process_offline_data(train_data_path: str, exp_dir: str, use_velocity_features: bool = True) -> dict:
     """
     Fase 1 & 2: costruisce e salva gli artefatti offline necessari alla pipeline.
 
@@ -109,9 +109,14 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
             'X_knn_scaled'   — Feature KNN scalate, shape (N, 38).
     """
     log = get_logger()
-    log.info("=== FASE 1 & 2: SETUP OFFLINE (FEATURE KNN 38D + torch.cdist) ===")
+    # Workspace separato per ogni combinazione di feature: evita che un cambio
+    # di use_velocity_features carichi silenziosamente il workspace sbagliato.
+    # Massimo 2 file coesistenti: offline_workspace.pkl (F=15) e offline_workspace_vel.pkl (F=38).
+    ws_suffix = '_vel' if use_velocity_features else ''
+    ws_label  = f'38D (dist + vel)' if use_velocity_features else f'15D (solo dist)'
+    log.info(f"=== FASE 1 & 2: SETUP OFFLINE (KNN feature {ws_label} + torch.cdist) ===")
 
-    out_pkl = os.path.join(exp_dir, 'offline_workspace.pkl')
+    out_pkl = os.path.join(exp_dir, f'offline_workspace{ws_suffix}.pkl')
     if os.path.exists(out_pkl):
         log.info(f"Artefatti trovati in '{out_pkl}', caricamento da cache.")
         with open(out_pkl, 'rb') as f:
@@ -124,10 +129,14 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
     targets_r = train_data['targets_robot']
     preds_h = train_data['preds']
 
-    log.info("Calcolo feature KNN (N, 38): distanze + velocità umano/robot...")
-    X_knn = compute_knn_features(targets_h, targets_r, preds_h)  # (N, 38)
+    log.info(f"Calcolo feature KNN (N, {ws_label})...")
+    X_knn = compute_knn_features(targets_h, targets_r, preds_h)  # sempre (N, 38)
+    if not use_velocity_features:
+        # Taglia le colonne di velocità: mantieni solo le 15 distanze giunto→robot
+        from pipeline_utils import N_JOINTS as _NJ
+        X_knn = X_knn[:, :_NJ]   # (N, 15)
 
-    log.info("Scaling a 38 dimensioni (StandardScaler)...")
+    log.info(f"Scaling a {X_knn.shape[1]} dimensioni (StandardScaler)...")
     scaler = StandardScaler().fit(X_knn)
     X_knn_scaled = scaler.transform(X_knn).astype(np.float32)
 

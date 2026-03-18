@@ -5,7 +5,7 @@ from tqdm import tqdm
 from joblib import Parallel, delayed
 from data_prep import compute_knn_features
 from train_regressor import KINEMATIC_GROUPS, JOINT_NAMES
-from pipeline_utils import build_feature_matrix, KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger, load_dataset, validate_offline_artifacts, knn_torch_batched
+from pipeline_utils import build_feature_matrix, KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger, load_dataset, validate_offline_artifacts, knn_torch_batched, N_JOINTS
 
 def compute_scores_for_joint(j, N_test, temp_strat, use_knn, storici_residui, sigma_global, test_residuals, test_neighbors):
     """
@@ -93,7 +93,9 @@ def run_test_inference(
 
     test_pkl = config['directories']['test_data']
     log.info(f"Caricamento test set: {test_pkl}")
-    validate_offline_artifacts(offline_artifacts)
+    abl_cfg = config.get('ablation', {})
+    use_velocity_features = abl_cfg.get('use_velocity_features', True)
+    validate_offline_artifacts(offline_artifacts, use_velocity_features=use_velocity_features)
     test_data = load_dataset(test_pkl)
 
     targets_h = test_data['targets_human']
@@ -101,13 +103,15 @@ def run_test_inference(
     preds = test_data['preds']
 
     log.info("Calcolo feature spaziali (distanze KNN) sul test set...")
-    # Feature (N, 38): 15 distanze + 15 vel umano + 8 vel robot
-    X_knn = compute_knn_features(targets_h, targets_r, preds)
+    # compute_knn_features restituisce sempre (N, 38); se use_velocity_features=False
+    # si taglia a (N, 15) — coerente con il workspace offline_workspace.pkl (F=15).
+    X_knn = compute_knn_features(targets_h, targets_r, preds)  # (N, 38)
+    if not use_velocity_features:
+        X_knn = X_knn[:, :N_JOINTS]   # (N, 15)
     scaler = offline_artifacts['scaler']
     X_test_scaled = scaler.transform(X_knn).astype(np.float32)
     N_test = X_test_scaled.shape[0]
 
-    abl_cfg = config.get('ablation', {})
     use_knn = abl_cfg.get('use_knn_matrices', True)
     temp_strat = abl_cfg.get('temporal_strategy', 'per_horizon')
 

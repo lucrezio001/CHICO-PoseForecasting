@@ -111,33 +111,34 @@ def load_dataset(pkl_path: str) -> dict:
     return data
 
 
-def validate_offline_artifacts(artifacts: dict) -> None:
+def validate_offline_artifacts(artifacts: dict, use_velocity_features: bool = True) -> None:
     """
     Verifica che offline_artifacts contenga tutte le chiavi obbligatorie
-    e che la dimensione delle feature sia coerente con N_KNN_FEATURES.
+    e che la dimensione di X_knn_scaled corrisponda al flag use_velocity_features.
 
-    Nota: 'ball_tree' NON è più una chiave richiesta (rimpiazzato da torch.cdist).
-    Se un workspace vecchio contiene ancora 'ball_tree' viene ignorato silenziosamente.
-    Se X_knn_scaled ha 15 colonne (vecchio formato) viene sollevato ValueError chiaro
-    per forzare la rigenerazione del workspace con F=38.
+    use_velocity_features=True  → atteso N_KNN_FEATURES=38 (dist + vel)
+    use_velocity_features=False → atteso N_JOINTS=15 (solo dist)
 
     Args:
-        artifacts: Dizionario prodotto da process_offline_data().
+        artifacts:              Dizionario prodotto da process_offline_data().
+        use_velocity_features:  Se True, controlla che X_knn_scaled abbia F=38.
 
     Raises:
         KeyError:   Se mancano chiavi obbligatorie.
-        ValueError: Se la shape di X_knn_scaled non corrisponde a N_KNN_FEATURES.
+        ValueError: Se la shape di X_knn_scaled non corrisponde al flag.
     """
     required = {'scaler', 'storici_residui', 'sigma_global', 'X_knn_scaled'}
     missing = required - set(artifacts.keys())
     if missing:
         raise KeyError(f"offline_artifacts: chiavi mancanti {missing}")
+    expected = N_KNN_FEATURES if use_velocity_features else N_JOINTS
     n_feat = artifacts['X_knn_scaled'].shape[1]
-    if n_feat != N_KNN_FEATURES:
+    if n_feat != expected:
+        ws_file = 'offline_workspace_vel.pkl' if use_velocity_features else 'offline_workspace.pkl'
         raise ValueError(
-            f"X_knn_scaled ha {n_feat} colonne, atteso N_KNN_FEATURES={N_KNN_FEATURES} "
-            f"(15 dist + 15 vel_umano + 8 vel_robot). "
-            "Elimina 'offline_workspace.pkl' per rigenerare il workspace con le nuove feature."
+            f"X_knn_scaled ha {n_feat} colonne, atteso {expected} "
+            f"(use_velocity_features={use_velocity_features}). "
+            f"Elimina '{ws_file}' per rigenerarlo con le feature corrette."
         )
 
 
