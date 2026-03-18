@@ -50,6 +50,11 @@ def validate_config(config: dict) -> None:
     if model not in ('xgb', 'qrf', 'tabpfn', 'tabicl', 'lgbm', 'realmlp', 'realmlp_s'):
         errors.append(f"active_model deve essere 'xgb', 'qrf', 'tabpfn', 'tabicl', 'lgbm', 'realmlp' o 'realmlp_s', trovato: '{model}'")
 
+    # Modalità collisione: valida collision_tuning.mode se presente
+    col_mode = config.get('collision_tuning', {}).get('mode', 'standard')
+    if col_mode not in ('standard', 'dynamic', 'dynamic2', 'dynamic3'):
+        errors.append(f"collision_tuning.mode deve essere 'standard', 'dynamic', 'dynamic2' o 'dynamic3', trovato: '{col_mode}'")
+
     # Verifica esistenza file dataset
     dirs = config.get('directories', {})
     for key in ('val_data', 'test_data'):

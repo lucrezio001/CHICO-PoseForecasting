@@ -30,12 +30,44 @@ model_params:
 # TUNING COLLISIONI (Metodo Dinamico vs Standard)
 # ==========================================
 collision_tuning:
-  # mode: "standard"  → Stage 1 ellissoidi + Stage 2 cilindro gonfiato (Catoni-Giulini)
-  #        "dynamic"  → grid search su m_bases e taus (usa Stage 2 dinamico)
-  #        "dynamic2" → variante dynamic con logica alternativa
-  mode: "standard"
-  m_bases: [0.03, 0.05, 0.08]  # margine base (metri) per soft-clipping dinamico
-  taus: [0.03, 0.05]           # fattore scala velocità relativa per R_soft
+  # Metodo di rilevamento collisioni per Fase 3.5 (validation) e Fase 5 (test).
+  #
+  # mode: "standard"  → Ellissoidi conformal fissi (Stage 1 only). Nessun movimento.
+  #                      Rapido, baseline di riferimento.
+  #
+  #        "dynamic"  → Cilindri gonfiati via soft-clipping (Catoni-Giulini):
+  #                      m_t = m_base + tau * V_rel
+  #                      R_soft = m_t * tanh(R_cp / m_t)
+  #                      Grid search su m_bases × taus.
+  #
+  #        "dynamic2" → Come dynamic ma con gate binario direzionale:
+  #                      gonfia SOLO se v_rel · d_vec > 0 (avvicinamento rilevato).
+  #                      m_base = 0 fisso. Grid search su taus.
+  #
+  #        "dynamic3" → Soft-gating continuo (combina dynamic + dynamic2):
+  #                      cos_θ = (v_rel · d_vec) / (|v_rel| |d_vec|)  ∈ [0,1]
+  #                      m_t = (m_base + tau * V_rel) * cos_θ
+  #                      R_soft = m_t * tanh(R_cp / m_t)
+  #                      Gonfiamento proporzionale all'angolo di avvicinamento:
+  #                        cos_θ=1 → avvicinamento diretto → R_soft massimo
+  #                        cos_θ=0 → perpendicolare/allontanamento → R_soft=0
+  #                      Grid search su m_bases × taus.
+  #                      Differenza da dynamic:  scale per cos_θ invece di fisso
+  #                      Differenza da dynamic2: m_base≠0 + modulazione continua
+  #
+  mode: "dynamic3"
+
+  # m_bases [metri]: margine base per la soglia fisica.
+  #   Usato da: dynamic, dynamic3. Ignorato da: standard, dynamic2.
+  #   Valori suggeriti: [0.03, 0.04, 0.05, 0.08]
+  #   Pseudo-codice originale: m_base = 0.04
+  m_bases: [0.03, 0.04, 0.05]
+
+  # taus [secondi]: guadagno velocità relativa per l'espansione dinamica.
+  #   Usato da: dynamic, dynamic2, dynamic3.
+  #   Valori suggeriti: [0.03, 0.05, 0.07, 0.10]
+  #   Pseudo-codice originale: tau = 0.05 (da testare anche 0.07)
+  taus: [0.05, 0.07]
 
 # ==========================================
 # CONTROLLO FASI PIPELINE
@@ -47,12 +79,11 @@ pipeline_flags:
 
   # collision_only: true  → salta training/inferenza, riesegue solo Fase 5 (FCL su bundle esistente)
   #                false  → pipeline completa
-  collision_only: false
+  collision_only: true
 
   # test_bundle_path: percorso al bundle .pkl salvato da una run precedente
   #   (usato solo con collision_only: true, lascia "" per autodetect nella exp_dir)
   test_bundle_path: ""
-
 # ==========================================
 # MODALITA' SINGOLA (Test veloci e Debug)
 # ==========================================
@@ -129,7 +160,7 @@ single_run:
     alpha: 0.1
     device: null
     predict_batch_size: 4000
-    subsample_size: 0    # 0 = usa tutto il calibration set (raccomandato per produzione)
+    subsample_size: 1000    # 0 = usa tutto il calibration set (raccomandato per produzione)
 
   # --- LightGBM ---
   # alpha, learning_rate: vedi XGB

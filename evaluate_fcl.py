@@ -375,6 +375,21 @@ def precompute_dynamic_tensors(
     r_max = targets_r_c.max(axis=1)                               # (T, 3)
     skip_frames = np.any(h_min > r_max, axis=1) | np.any(h_max < r_min, axis=1)  # (T,)
 
+    # --- cos_theta normalizzato per dynamic3: soft-gating continuo ---
+    # cos_theta = v_rel · d_vec / (|v_rel| * |d_vec|)  ∈ [-1, 1]
+    #   +1 → umano e robot puntano esattamente l'uno verso l'altro (avvicinamento pieno)
+    #    0 → movimento perpendicolare (nessuna componente radiale)
+    #   <0 → si allontanano → clippato a 0 (nessun gonfiamento)
+    # V_rel è già la norma di v_diff, shape (T, 16, 8).
+    norm_d_diff = np.linalg.norm(d_diff, axis=-1)  # (T, 16, 8)
+    denom_cos = V_rel * norm_d_diff  # (T, 16, 8)
+    cos_theta = np.where(
+        denom_cos > 1e-5,
+        convergenza / denom_cos,
+        0.0
+    )
+    cos_theta = np.clip(cos_theta, 0.0, 1.0)  # (T, 16, 8) — negativi → 0 (si allontanano)
+
     return {
         'vel_h':        vel_h,
         'vel_r':        vel_r,
@@ -382,6 +397,7 @@ def precompute_dynamic_tensors(
         'R_cp_seg':     R_cp_seg,
         'V_rel':        V_rel,
         'convergenza':  convergenza,
+        'cos_theta':    cos_theta,
         'skip_frames':  skip_frames,
     }
 
@@ -506,6 +522,78 @@ def check_collision_dynamic_frame_v3(
     return False
 
 
+def check_collision_dynamic_frame_v4(
+    preds_h_frame: np.ndarray,
+    targets_r_frame: np.ndarray,
+    robot_objs: list,
+    allarme_conformal: bool,
+    m_base_mm: float,
+    tau: float,
+    R_cp_seg_h: np.ndarray,
+    V_rel_h: np.ndarray,
+    cos_theta_h: np.ndarray,
+) -> bool:
+    """
+    Stage 2 — Soft-gating cinematico (singolo frame, dynamic3).
+
+    Unisce dynamic (m_base ≠ 0) e dynamic2 (gating direzionale), ma usa cos_theta
+    come **modulatore continuo** invece di gate binario:
+
+        cos_θ  = (v_rel · d_vec) / (|v_rel| · |d_vec|)   clippato a [0, 1]
+        m_t    = (m_base + τ · V_rel) · cos_θ
+        R_soft = m_t · tanh(R_cp / m_t)                   se cos_θ > 0, else 0
+        r_test = r_anat + R_soft
+
+    Proprietà:
+    - cos_θ = 0 (perpendicolare o allontanamento) → R_soft = 0, come standard
+    - cos_θ = 1 (avvicinamento diretto)           → R_soft come dynamic con m_t pieno
+    - cos_θ ∈ (0,1) (avvicinamento obliquo)       → gonfiamento proporzionale
+
+    Collisione: d_FCL(Cyl(p_a, p_b, r_test), Cyl_robot) ≤ 130mm.
+
+    Args:
+        preds_h_frame:   (15, 3) — predizioni giunti umani al frame h
+        targets_r_frame: (9, 3)  — posizioni robot GT al frame h
+        robot_objs:      list    — oggetti FCL robot (pre-costruiti)
+        allarme_conformal: bool  — True se Stage 1 ha rilevato prossimità
+        m_base_mm:       float   — soglia base in mm (conv. m → mm fatta dal chiamante)
+        tau:             float   — guadagno velocità [s]
+        R_cp_seg_h:      (16,)   — R_cp per segmento al frame h
+        V_rel_h:         (16, 8) — norma velocità relativa seg×link
+        cos_theta_h:     (16, 8) — coseno direzionale ∈ [0, 1], già clippato
+    """
+    req = fcl.DistanceRequest()
+
+    for seg_idx, (a, b) in enumerate(CONN_HUMAN):
+        r_anat = SEGMENT_RADII[(a, b)]
+
+        if not allarme_conformal:
+            # Nessun gonfiamento: crea il cilindro UNA VOLTA con r_anat
+            hum_cyl = crea_cilindro(preds_h_frame[a], preds_h_frame[b], r_anat)
+            for rob_obj in robot_objs:
+                res = fcl.DistanceResult()
+                if fcl.distance(hum_cyl, rob_obj, req, res) <= SOGLIA_COLLISIONE:
+                    return True
+        else:
+            R_cp_seg = R_cp_seg_h[seg_idx]
+            for rob_idx, rob_obj in enumerate(robot_objs):
+                cos_t = cos_theta_h[seg_idx, rob_idx]  # ∈ [0, 1], già clippato
+                if cos_t > 1e-9:
+                    # Soft-gating continuo: m_t modulato dal coseno direzionale
+                    V_rel = V_rel_h[seg_idx, rob_idx]
+                    m_t = (m_base_mm + tau * V_rel) * cos_t
+                    R_soft = m_t * np.tanh(R_cp_seg / m_t) if m_t > 1e-9 else 0.0
+                else:
+                    # Movimento perpendicolare o di allontanamento → nessun gonfiamento
+                    R_soft = 0.0
+                hum_cyl = crea_cilindro(preds_h_frame[a], preds_h_frame[b], r_anat + R_soft)
+                res = fcl.DistanceResult()
+                if fcl.distance(hum_cyl, rob_obj, req, res) <= SOGLIA_COLLISIONE:
+                    return True
+
+    return False
+
+
 def valuta_clip(
     i: int,
     targets_h_c: np.ndarray,
@@ -560,6 +648,29 @@ def valuta_clip(
                 R_cp_seg_h=precomp['R_cp_seg'][h],
                 V_rel_h=precomp['V_rel'][h],
                 convergenza_h=precomp['convergenza'][h],
+            ):
+                pred_crash = True
+                break
+
+    elif mode == "dynamic3":
+        # Soft-gating continuo: m_base ≠ 0 + cos_theta come modulatore proporzionale.
+        # Combina dynamic (m_base + tau*V_rel) con dynamic2 (gating direzionale)
+        # ma usa cos_theta ∈ [0,1] invece di gate binario → gonfiamento proporzionale
+        # all'angolo di avvicinamento.
+        m_base_mm = m_base * 1000.0
+        precomp = precompute_dynamic_tensors(preds_h_c, targets_r_c, W_c, Cov_c)
+        for h in range(25):
+            if precomp['skip_frames'][h]:
+                continue
+            robot_objs = _build_robot_objects(targets_r_c[h])
+            allarme = check_collision_conformal_frame(preds_h_c[h], W_c[h], Cov_c[h], robot_objs)
+            if check_collision_dynamic_frame_v4(
+                preds_h_c[h], targets_r_c[h],
+                robot_objs, allarme,
+                m_base_mm, tau,
+                R_cp_seg_h=precomp['R_cp_seg'][h],
+                V_rel_h=precomp['V_rel'][h],
+                cos_theta_h=precomp['cos_theta'][h],
             ):
                 pred_crash = True
                 break
@@ -651,6 +762,53 @@ def run_fcl_evaluation(results_file: str, config: dict = None, cache_file: str =
 
         log.info(f"Grid search completata. Vincitore: tau={migliori_params}s (F1: {miglior_f1:.4f})")
 
+    if mode == 'dynamic3':
+        # Grid search (m_bases × taus) come dynamic, ma con soft-gating cos_theta
+        m_bases = col_cfg.get('m_bases', [0.04])
+        taus = col_cfg.get('taus', [0.05])
+        miglior_f1 = 0.0
+        migliori_params = None
+        gt_collisions_np = None
+        best_pred_collisions_np = None
+
+        grid_pairs = [(m, t) for m in m_bases for t in taus]
+        log.info(f"Grid search su {len(grid_pairs)} combinazioni (m_bases × taus) [soft-gating]...")
+        for m_base, tau in tqdm(grid_pairs, desc="      [dynamic3 grid]", unit="config"):
+            risultati = list(tqdm(
+                Parallel(n_jobs=-1, return_as="generator")(
+                    delayed(valuta_clip)(i, targets_h[i], preds_h[i], targets_r[i], W[i], Cov[i],
+                                        use_cache, cache_gt, mode="dynamic3", m_base=m_base, tau=tau)
+                    for i in range(num_clips)
+                ),
+                total=num_clips,
+                desc=f"        m={m_base} τ={tau}",
+                unit="clip",
+                leave=False,
+            ))
+            risultati.sort(key=lambda x: x[0])
+
+            if gt_collisions_np is None:
+                gt_collisions_np = np.array([ris[1] for ris in risultati])
+            current_pred = np.array([ris[2] for ris in risultati])
+
+            TP = np.sum(gt_collisions_np & current_pred)
+            FP = np.sum((~gt_collisions_np) & current_pred)
+            FN = np.sum(gt_collisions_np & (~current_pred))
+            TN = np.sum((~gt_collisions_np) & (~current_pred))
+
+            precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+            recall    = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+            f1        = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            log.info(f"[Grid dynamic3] m_base={m_base}m, tau={tau}s -> TP:{TP} FP:{FP} FN:{FN} TN:{TN} F1:{f1:.4f}")
+
+            if f1 >= miglior_f1:
+                miglior_f1 = f1
+                migliori_params = (m_base, tau)
+                best_pred_collisions_np = current_pred.copy()
+
+        log.info(f"Grid search completata. Vincitore: m_base={migliori_params[0]}m, tau={migliori_params[1]}s (F1: {miglior_f1:.4f})")
+
     if mode == 'standard':
         log.info(f"Calcolo collisioni su {num_clips} clip (parallelo)...")
         risultati = Parallel(n_jobs=-1)(
@@ -732,6 +890,8 @@ def run_fcl_evaluation(results_file: str, config: dict = None, cache_file: str =
             f.write(f"Migliori Parametri: m_base={migliori_params[0]}m, tau={migliori_params[1]}s\n")
         elif mode == 'dynamic2':
             f.write(f"Migliori Parametri: tau={migliori_params}s (m_base=0 fisso)\n")
+        elif mode == 'dynamic3':
+            f.write(f"Migliori Parametri: m_base={migliori_params[0]}m, tau={migliori_params[1]}s (soft-gating cos_theta)\n")
         f.write("-----------------------------------\n")
         f.write(f"TP: {TP}\nFP: {FP}\nFN: {FN}\nTN: {TN}\n")
         f.write(f"Precision: {precision:.4f}\nRecall: {recall:.4f}\nF1 Score: {f1:.4f}\n")
