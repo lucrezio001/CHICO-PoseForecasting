@@ -4,6 +4,17 @@ from quantile_forest import RandomForestQuantileRegressor
 from tabpfn import TabPFNRegressor
 import warnings
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Singleton per il backbone di TabICLv2.
+# Il problema: con 375 modelli (15 giunti × 25 orizzonti), creare 375 istanze
+# di TabICLRegressor accumula i pesi del transformer in VRAM 375 volte → OOM.
+# Soluzione: un unico TabICLRegressor condiviso per device (modello singleton).
+# Ogni wrapper memorizza il proprio contesto di training come numpy array CPU,
+# e lo carica sul backbone condiviso al momento di predict() (JIT-fit).
+# Questo mantiene la VRAM costante indipendentemente dal numero di modelli.
+# ──────────────────────────────────────────────────────────────────────────────
+_TABICL_SINGLETON: dict = {}  # key: str(device) → TabICLRegressor
+
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 warnings.filterwarnings("ignore", category=UserWarning, module="pytabkit")
 
@@ -88,24 +99,23 @@ class TabICLQuantileWrapper:
     """
     Wrapper TabICLv2 (tabicl) per regressione quantile zero-shot.
 
-    TabICLv2 è un foundation model pre-addestrato (checkpoint Hugging Face):
-    - fit() è solo preprocessing dei dati (istantaneo, scarica checkpoint 1 sola volta)
-    - predict() esegue in-context learning transformer → nessun training necessario
-    - 10x più veloce di TabPFN-2.5 su grandi test set grazie a Flash Attention + AMP
+    Architettura VRAM-safe per pipeline con 375 modelli (15 giunti × 25 orizzonti):
 
-    Differenza da TabPFN:
-    - TabPFN: fit memorizza dati, predict fa attention O(N_train × N_batch)
-    - TabICL: fit prepara preprocessing, predict usa architettura più efficiente
-    - Supporta `output_type="quantiles"` per predizione nativa di quantili multipli
+    Problema originale: ogni istanza chiamava TabICLRegressor() in __init__ e
+    model.fit() in fit(), accumulando i pesi del transformer (+ contesto training)
+    in VRAM per ogni (j,h). Con 375 modelli → VRAM satura e inferenza rallenta.
+
+    Soluzione: backbone singleton (un solo TabICLRegressor per device in VRAM).
+    - __init__: recupera/crea il singleton dal registro _TABICL_SINGLETON
+    - fit():    salva il contesto come numpy arrays CPU (nessuna GPU memory)
+    - predict(): JIT-fit del backbone con il contesto CPU, poi inferenza, poi
+                 torch.cuda.empty_cache() per liberare tensori temporanei
 
     Parametri:
-        subsample_size: se > 0, campiona casualmente N campioni dal training set prima
-                        di passarli al modello. Riduce il tempo di inferenza linearmente
-                        (l'attention è O(N_train × N_batch_test)).
-                        Raccomandato: 0 (usa tutto) o 1000–4000 per ablation velocità.
-                        Sotto 300 campioni la qualità degrada significativamente.
-
-    Limite: performance zero-shot migliore con N_train > 300 campioni.
+        subsample_size: se > 0, campiona N punti dal training set prima del fit.
+                        Riduce il tempo di inferenza ~linearmente con N_train.
+                        Raccomandato: 0 (usa tutto) o 1000–4000 per ablation.
+                        Sotto 300 la qualità degrada significativamente.
     """
 
     def __init__(
@@ -118,37 +128,67 @@ class TabICLQuantileWrapper:
     ):
         self.target_quantile = round(1.0 - alpha, 4)
         self.predict_batch_size = predict_batch_size
-        # subsample_size=0 → usa tutto il training set (comportamento default)
         self.subsample_size = subsample_size
         self.rng = np.random.default_rng(random_state)
-        from tabicl import TabICLRegressor
-        self.model = TabICLRegressor(device=device)
+        self._device = device
+        # Contesto training (CPU numpy): popolato da fit(), usato da predict()
+        self._X_ctx: np.ndarray | None = None
+        self._y_ctx: np.ndarray | None = None
+        # Assicura che il singleton del backbone esista (carica pesi una sola volta)
+        _key = str(device)
+        if _key not in _TABICL_SINGLETON:
+            from tabicl import TabICLRegressor
+            _TABICL_SINGLETON[_key] = TabICLRegressor(device=device)
+
+    @property
+    def _backbone(self):
+        """Riferimento al backbone condiviso (singleton per device)."""
+        return _TABICL_SINGLETON[str(self._device)]
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "TabICLQuantileWrapper":
+        """Salva il contesto di training come numpy CPU. Non tocca la VRAM."""
         if self.subsample_size > 0 and len(X) > self.subsample_size:
             idx = self.rng.choice(len(X), size=self.subsample_size, replace=False)
             X, y = X[idx], y[idx]
-        self.model.fit(X, y)
+        # Copia esplicita: X/y potrebbero essere view di array più grandi
+        self._X_ctx = X.copy()
+        self._y_ctx = y.copy()
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
-        Predice il quantile (1-alpha) in batch per evitare OOM.
+        JIT-fit del backbone condiviso con il contesto di questa istanza,
+        poi inferenza in batch. Libera la VRAM temporanea al termine.
 
         Returns:
             np.ndarray shape (n_samples,)
         """
+        if self._X_ctx is None:
+            raise RuntimeError("predict() chiamato prima di fit(): contesto di training assente.")
+        # Carica il contesto di questa istanza sul backbone condiviso
+        self._backbone.fit(self._X_ctx, self._y_ctx)
+
         n = X.shape[0]
         if self.predict_batch_size <= 0 or n <= self.predict_batch_size:
-            out = self.model.predict(X, output_type="quantiles", alphas=[self.target_quantile])
-            return out[:, 0].ravel()
+            out = self._backbone.predict(X, output_type="quantiles", alphas=[self.target_quantile])
+            result = out[:, 0].ravel()
+        else:
+            results = []
+            for start in range(0, n, self.predict_batch_size):
+                batch = X[start : start + self.predict_batch_size]
+                out = self._backbone.predict(batch, output_type="quantiles", alphas=[self.target_quantile])
+                results.append(out[:, 0])
+            result = np.concatenate(results, axis=0)
 
-        results = []
-        for start in range(0, n, self.predict_batch_size):
-            batch = X[start : start + self.predict_batch_size]
-            out = self.model.predict(batch, output_type="quantiles", alphas=[self.target_quantile])
-            results.append(out[:, 0])
-        return np.concatenate(results, axis=0)
+        # Libera tensori temporanei VRAM (contesto + output del forward pass)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+        return result
 
 
 class LGBMQuantileWrapper:
