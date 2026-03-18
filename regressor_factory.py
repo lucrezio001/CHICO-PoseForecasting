@@ -98,16 +98,36 @@ class TabICLQuantileWrapper:
     - TabICL: fit prepara preprocessing, predict usa architettura più efficiente
     - Supporta `output_type="quantiles"` per predizione nativa di quantili multipli
 
+    Parametri:
+        subsample_size: se > 0, campiona casualmente N campioni dal training set prima
+                        di passarli al modello. Riduce il tempo di inferenza linearmente
+                        (l'attention è O(N_train × N_batch_test)).
+                        Raccomandato: 0 (usa tutto) o 1000–4000 per ablation velocità.
+                        Sotto 300 campioni la qualità degrada significativamente.
+
     Limite: performance zero-shot migliore con N_train > 300 campioni.
     """
 
-    def __init__(self, alpha: float, device: str | None = None, predict_batch_size: int = 4000):
+    def __init__(
+        self,
+        alpha: float,
+        device: str | None = None,
+        predict_batch_size: int = 4000,
+        subsample_size: int = 0,
+        random_state: int = 42,
+    ):
         self.target_quantile = round(1.0 - alpha, 4)
         self.predict_batch_size = predict_batch_size
+        # subsample_size=0 → usa tutto il training set (comportamento default)
+        self.subsample_size = subsample_size
+        self.rng = np.random.default_rng(random_state)
         from tabicl import TabICLRegressor
         self.model = TabICLRegressor(device=device)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "TabICLQuantileWrapper":
+        if self.subsample_size > 0 and len(X) > self.subsample_size:
+            idx = self.rng.choice(len(X), size=self.subsample_size, replace=False)
+            X, y = X[idx], y[idx]
         self.model.fit(X, y)
         return self
 
@@ -279,6 +299,8 @@ def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper 
             alpha=alpha,
             device=run_cfg.get('device', None),  # None = auto-detect GPU
             predict_batch_size=run_cfg.get('predict_batch_size', 4000),
+            subsample_size=run_cfg.get('subsample_size', 0),
+            random_state=random_state,
         )
     elif reg_type == 'lgbm':
         return LGBMQuantileWrapper(

@@ -150,9 +150,11 @@ def build_exp_name(config: dict) -> str:
         ep_part = f"_ep{ep}" if ep is not None else ""
         return f"exp_{active_model}_a{alpha}{ep_part}{abl_suffix}"
     elif active_model == 'tabicl':
+        ss  = run_cfg.get('subsample_size', 0)
         pb  = run_cfg.get('predict_batch_size', 0)
+        ss_part = f"_ss{ss}" if ss > 0 else ""
         pb_part = f"_pb{pb}" if pb > 0 else ""
-        return f"exp_tabicl_a{alpha}{pb_part}{abl_suffix}"
+        return f"exp_tabicl_a{alpha}{ss_part}{pb_part}{abl_suffix}"
     else:
         # tabpfn e altri con subsample/batch params
         ss  = run_cfg.get('subsample_size', 0)

@@ -3,7 +3,7 @@
 # ==========================================
 # experiment_mode: "single" → esegue 1 esperimento con i parametri di single_run
 #                  "batch"  → esegue tutte le combinazioni di batch_run (prodotto cartesiano)
-experiment_mode: "batch"
+experiment_mode: "single"
 
 # active_model: quale regressore quantile usare
 #   "xgb"      → XGBoost         (GPU, ~5 min/375 modelli, stabile, raccomandato produzione)
@@ -13,7 +13,7 @@ experiment_mode: "batch"
 #   "tabicl"   → TabICLv2        (GPU auto, ~mins training + ~45 min inferenza, zero-shot foundation model)
 #   "realmlp"  → RealMLP_TD      (GPU, ~3-4 ore/375 modelli, rete grande pytabkit)
 #   "realmlp_s"→ RealMLP_TD_S    (GPU, ~1-2 ore/375 modelli, rete piccola pytabkit)
-active_model: "lgbm"
+active_model: "tabicl"
 
 directories:
   val_data: "chico_calib_extraction.pkl"   # dataset calibrazione (~433 MB, ~8400 clip)
@@ -121,10 +121,15 @@ single_run:
   # device: null → auto-detect GPU (raccomandato); "cuda" / "cpu" per forzare
   # predict_batch_size: batch inferenza test set (TabICLv2 regge batch più grandi di TabPFN)
   #   Il checkpoint viene scaricato da HuggingFace (jingang/TabICL) al primo utilizzo
+  # subsample_size: campioni training usati come contesto (0 = usa tutti, ~7980 per CHICO)
+  #   Riduce inferenza ~linearmente con N_train (l'attention è O(N_train × N_batch_test))
+  #   Speedup stimato: 2000→~3x, 4000→~2x, 0 (tutto)→baseline ~45 min
+  #   Minimo consigliato: 1000 (sotto 300 la qualità degrada significativamente)
   tabicl:
-    alpha: 0.9
+    alpha: 0.1
     device: null
     predict_batch_size: 4000
+    subsample_size: 0    # 0 = usa tutto il calibration set (raccomandato per produzione)
 
   # --- LightGBM ---
   # alpha, learning_rate: vedi XGB
@@ -198,7 +203,9 @@ batch_run:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     device: [null]
     predict_batch_size: [4000]
-    # totale: 9 combinazioni (~45 min ciascuna)
+    subsample_size: [0]   # aggiungi [1000, 2000, 4000] per ablation velocità/accuratezza
+    # totale: 9 combinazioni (~45 min ciascuna con subsample_size=0)
+    # con subsample_size: [0, 2000, 4000] → 27 combinazioni (~9+15+25 ore)
 
   lgbm:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
