@@ -205,7 +205,7 @@ def run_experiment(config: dict, offline_artifacts: dict, is_batch: bool = False
     if collision_only:
         bundle_path = flags.get('test_bundle_path', '').strip()
         if not bundle_path:
-            bundle_path = os.path.join(exp_dir, 'test_results_bundle.pkl')
+            bundle_path = os.path.join(exp_dir, 'test_results.pkl')
         if not os.path.exists(bundle_path):
             raise FileNotFoundError(
                 f"collision_only=true ma bundle non trovato: '{bundle_path}'\n"
