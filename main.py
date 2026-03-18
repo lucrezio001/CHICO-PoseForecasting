@@ -47,8 +47,8 @@ def validate_config(config: dict) -> None:
 
     if mode not in ('single', 'batch'):
         errors.append(f"experiment_mode deve essere 'single' o 'batch', trovato: '{mode}'")
-    if model not in ('xgb', 'qrf', 'tabpfn', 'lgbm', 'realmlp', 'realmlp_s'):
-        errors.append(f"active_model deve essere 'xgb', 'qrf', 'tabpfn', 'lgbm', 'realmlp' o 'realmlp_s', trovato: '{model}'")
+    if model not in ('xgb', 'qrf', 'tabpfn', 'tabicl', 'lgbm', 'realmlp', 'realmlp_s'):
+        errors.append(f"active_model deve essere 'xgb', 'qrf', 'tabpfn', 'tabicl', 'lgbm', 'realmlp' o 'realmlp_s', trovato: '{model}'")
 
     # Verifica esistenza file dataset
     dirs = config.get('directories', {})
@@ -149,8 +149,12 @@ def build_exp_name(config: dict) -> str:
         ep = run_cfg.get('n_epochs', 64)
         ep_part = f"_ep{ep}" if ep is not None else ""
         return f"exp_{active_model}_a{alpha}{ep_part}{abl_suffix}"
+    elif active_model == 'tabicl':
+        pb  = run_cfg.get('predict_batch_size', 0)
+        pb_part = f"_pb{pb}" if pb > 0 else ""
+        return f"exp_tabicl_a{alpha}{pb_part}{abl_suffix}"
     else:
-        # tabpfn e modelli futuri con subsample/batch params
+        # tabpfn e altri con subsample/batch params
         ss  = run_cfg.get('subsample_size', 0)
         pb  = run_cfg.get('predict_batch_size', 0)
         ss_part = f"_ss{ss}" if ss > 0 else ""
@@ -246,7 +250,7 @@ def run_experiment(config: dict, offline_artifacts: dict, is_batch: bool = False
         t_start_infer = time.time()
         # Per TabPFN i modelli non vengono salvati su disco (in-context learning: troppo spazio,
         # troppo lento da serializzare). Li passiamo direttamente in-memory.
-        models_in_memory = trained_models if active_model == 'tabpfn' else None
+        models_in_memory = trained_models if active_model in ('tabpfn', 'tabicl') else None
         test_results_path, num_test_clips = run_test_inference(
             config, exp_dir, offline_artifacts, models_dict=models_in_memory
         )

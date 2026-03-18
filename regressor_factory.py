@@ -84,6 +84,53 @@ class TabPFNQuantileWrapper:
             results.append(preds[0])
         return np.concatenate(results, axis=0)
 
+class TabICLQuantileWrapper:
+    """
+    Wrapper TabICLv2 (tabicl) per regressione quantile zero-shot.
+
+    TabICLv2 è un foundation model pre-addestrato (checkpoint Hugging Face):
+    - fit() è solo preprocessing dei dati (istantaneo, scarica checkpoint 1 sola volta)
+    - predict() esegue in-context learning transformer → nessun training necessario
+    - 10x più veloce di TabPFN-2.5 su grandi test set grazie a Flash Attention + AMP
+
+    Differenza da TabPFN:
+    - TabPFN: fit memorizza dati, predict fa attention O(N_train × N_batch)
+    - TabICL: fit prepara preprocessing, predict usa architettura più efficiente
+    - Supporta `output_type="quantiles"` per predizione nativa di quantili multipli
+
+    Limite: performance zero-shot migliore con N_train > 300 campioni.
+    """
+
+    def __init__(self, alpha: float, device: str | None = None, predict_batch_size: int = 4000):
+        self.target_quantile = round(1.0 - alpha, 4)
+        self.predict_batch_size = predict_batch_size
+        from tabicl import TabICLRegressor
+        self.model = TabICLRegressor(device=device)
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "TabICLQuantileWrapper":
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Predice il quantile (1-alpha) in batch per evitare OOM.
+
+        Returns:
+            np.ndarray shape (n_samples,)
+        """
+        n = X.shape[0]
+        if self.predict_batch_size <= 0 or n <= self.predict_batch_size:
+            out = self.model.predict(X, output_type="quantiles", alphas=[self.target_quantile])
+            return out[:, 0].ravel()
+
+        results = []
+        for start in range(0, n, self.predict_batch_size):
+            batch = X[start : start + self.predict_batch_size]
+            out = self.model.predict(batch, output_type="quantiles", alphas=[self.target_quantile])
+            results.append(out[:, 0])
+        return np.concatenate(results, axis=0)
+
+
 class LGBMQuantileWrapper:
     """
     Wrapper LightGBM per regressione quantile.
@@ -176,14 +223,15 @@ class RealMLPQuantileWrapper:
         return self.model.predict(X).ravel()
 
 
-def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | LGBMQuantileWrapper | RealMLPQuantileWrapper | object:
+def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper | TabICLQuantileWrapper | LGBMQuantileWrapper | RealMLPQuantileWrapper | object:
     """
     Factory: istanzia il regressore quantile specificato in config['active_model'].
 
     Modelli supportati:
     - 'qrf':      RandomForestQuantileRegressor (quantile_forest) — quantile nativo.
     - 'xgb':      XGBQuantileWrapper — XGBoost con objective 'reg:quantileerror'.
-    - 'tabpfn':   TabPFNQuantileWrapper — TabPFN pre-addestrato in-context learning.
+    - 'tabpfn':   TabPFNQuantileWrapper — TabPFN in-context learning (KV cache).
+    - 'tabicl':   TabICLQuantileWrapper — TabICLv2 zero-shot foundation model (10x più veloce di TabPFN).
     - 'lgbm':     LGBMQuantileWrapper — LightGBM con objective 'quantile'. CPU-only, veloce.
     - 'realmlp':  RealMLPQuantileWrapper — RealMLP_TD (pytabkit) con pinball loss.
     - 'realmlp_s':RealMLPQuantileWrapper — RealMLP_TD_S (small, più veloce) con pinball loss.
@@ -226,6 +274,12 @@ def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper 
             device=run_cfg.get('device', 'cpu'),
             predict_batch_size=run_cfg.get('predict_batch_size', 2000),
         )
+    elif reg_type == 'tabicl':
+        return TabICLQuantileWrapper(
+            alpha=alpha,
+            device=run_cfg.get('device', None),  # None = auto-detect GPU
+            predict_batch_size=run_cfg.get('predict_batch_size', 4000),
+        )
     elif reg_type == 'lgbm':
         return LGBMQuantileWrapper(
             alpha=alpha,
@@ -244,4 +298,4 @@ def build_regressor(config: dict) -> XGBQuantileWrapper | TabPFNQuantileWrapper 
             n_epochs=run_cfg.get('n_epochs', 64),
         )
     else:
-        raise ValueError(f"Regressore '{reg_type}' non riconosciuto. Scegli tra: qrf, xgb, tabpfn, lgbm, realmlp, realmlp_s.")
+        raise ValueError(f"Regressore '{reg_type}' non riconosciuto. Scegli tra: qrf, xgb, tabpfn, tabicl, lgbm, realmlp, realmlp_s.")

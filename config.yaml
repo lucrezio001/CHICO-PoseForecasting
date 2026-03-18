@@ -64,6 +64,11 @@ single_run:
     subsample_size: 200       # Max campioni training per modello (TabPFN: limite pratico ~4000-8000)
     predict_batch_size: 7000  # Batch inferenza: evita CUDA OOM sul test set (~61k campioni)
 
+  tabicl:
+    alpha: 0.9
+    device: null              # null = auto-detect GPU (raccomandato)
+    predict_batch_size: 4000  # Batch inferenza (TabICLv2 è 10x più veloce di TabPFN)
+
   lgbm:
     alpha: 0.9
     n_estimators: 200
@@ -112,6 +117,11 @@ batch_run:
     device: ["cuda"]
     subsample_size: [1000, 3000, 6000]        # Max campioni training per modello; 0 = nessun subsample
     predict_batch_size: [4000]    # Batch inferenza; 0 = nessun batching
+
+  tabicl:
+    alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    device: [null]              # null = auto-detect GPU
+    predict_batch_size: [4000]
 
   lgbm:
     alpha: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
