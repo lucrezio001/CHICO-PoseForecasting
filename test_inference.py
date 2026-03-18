@@ -3,9 +3,9 @@ import pickle
 import numpy as np
 from tqdm import tqdm
 from joblib import Parallel, delayed
-from data_prep import compute_15_distances
+from data_prep import compute_knn_features
 from train_regressor import KINEMATIC_GROUPS, JOINT_NAMES
-from pipeline_utils import build_feature_matrix, KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger, load_dataset, validate_offline_artifacts
+from pipeline_utils import build_feature_matrix, KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger, load_dataset, validate_offline_artifacts, knn_torch_batched
 
 def compute_scores_for_joint(j, N_test, temp_strat, use_knn, storici_residui, sigma_global, test_residuals, test_neighbors):
     """
@@ -101,26 +101,26 @@ def run_test_inference(
     preds = test_data['preds']
 
     log.info("Calcolo feature spaziali (distanze KNN) sul test set...")
-    # Passa solo il frame presente (H=0): evita di allocare il tensore completo (N,25,15,R,3)
-    distances = compute_15_distances(targets_h[:, 0:1, ...], targets_r[:, 0:1, ...])
-    X_knn = distances[:, 0, :]
+    # Feature (N, 38): 15 distanze + 15 vel umano + 8 vel robot
+    X_knn = compute_knn_features(targets_h, targets_r, preds)
     scaler = offline_artifacts['scaler']
-    X_test_scaled = scaler.transform(X_knn)
+    X_test_scaled = scaler.transform(X_knn).astype(np.float32)
     N_test = X_test_scaled.shape[0]
-    
+
     abl_cfg = config.get('ablation', {})
     use_knn = abl_cfg.get('use_knn_matrices', True)
     temp_strat = abl_cfg.get('temporal_strategy', 'per_horizon')
-    
-    ball_tree = offline_artifacts['ball_tree']
+
     storici_residui = offline_artifacts['storici_residui']
     sigma_global = offline_artifacts['sigma_global']
     k_neighbors = config['model_params']['k_neighbors']
-    
+    X_calib_scaled = offline_artifacts['X_knn_scaled']
+
     test_neighbors = None
     if use_knn:
-        log.info(f"Interrogazione BallTree per {N_test} campioni (k={k_neighbors})...")
-        _, test_neighbors = ball_tree.query(X_test_scaled, k=k_neighbors)
+        # torch.cdist batched: query N_test contro N_calib (F=38), ~15ms su GPU
+        log.info(f"KNN (torch.cdist) per {N_test} campioni test (k={k_neighbors})...")
+        test_neighbors = knn_torch_batched(X_test_scaled, X_calib_scaled, k=k_neighbors)
 
     test_residuals = targets_h - preds
 

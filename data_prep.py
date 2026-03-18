@@ -2,8 +2,10 @@ import os
 import pickle
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.neighbors import BallTree
-from pipeline_utils import get_logger, load_dataset
+from pipeline_utils import (
+    get_logger, load_dataset,
+    FRAME_RATE_S, _CONN_ROBOT_A, _CONN_ROBOT_B,
+)
 
 def compute_15_distances(targets_human: np.ndarray, targets_robot: np.ndarray) -> np.ndarray:
     """
@@ -30,13 +32,66 @@ def compute_15_distances(targets_human: np.ndarray, targets_robot: np.ndarray) -
     dists = np.linalg.norm(diffs, axis=-1)   # (N, H, 15, R)
     return np.min(dists, axis=-1)            # (N, H, 15)
 
+def compute_knn_features(
+    targets_h: np.ndarray,
+    targets_r: np.ndarray,
+    preds_h: np.ndarray,
+) -> np.ndarray:
+    """
+    Calcola il vettore feature (N, 38) per la ricerca KNN.
+
+    Struttura del vettore (F=38, NON scalato):
+        [ dist_0 … dist_14 ]       — 15 distanze minime giunto→robot al frame H=0
+        [ vel_h_0 … vel_h_14 ]     — 15 norme velocità giunti umani  (H=0 → H=1)
+        [ vel_r_0 … vel_r_7  ]     —  8 norme velocità centri link robot (H=0 → H=1)
+
+    Le velocità sono calcolate come differenze finite tra il frame H=0 e H=1
+    (primo e secondo frame dell'orizzonte di predizione), divise per FRAME_RATE_S.
+    Per l'umano si usano le predizioni del modello GCN (coerente tra calibrazione
+    e test; disponibile in entrambi i PKL). Per il robot si usa il ground truth
+    (sempre noto, zero data leakage).
+
+    Args:
+        targets_h: Posizioni GT giunti umani, shape (N, 25, 15, 3).
+        targets_r: Posizioni GT link robot,   shape (N, 25,  9, 3).
+        preds_h:   Predizioni GCN,            shape (N, 25, 15, 3).
+
+    Returns:
+        X_knn: Feature matrix, shape (N, 38), dtype float32.
+    """
+    # --- 15 distanze minime giunto→robot al frame H=0 ---
+    distances = compute_15_distances(
+        targets_h[:, 0:1, ...], targets_r[:, 0:1, ...]
+    )[:, 0, :]                                            # (N, 15)
+
+    # --- 15 norme velocità giunti umani (H=0 → H=1, da predizioni) ---
+    vel_h_vec = (preds_h[:, 1, :, :] - preds_h[:, 0, :, :]) / FRAME_RATE_S  # (N, 15, 3)
+    vel_h_norm = np.linalg.norm(vel_h_vec, axis=-1)                           # (N, 15)
+
+    # --- 8 norme velocità centri link robot (H=0 → H=1, da GT) ---
+    r_centers_0 = 0.5 * (
+        targets_r[:, 0, _CONN_ROBOT_A, :] + targets_r[:, 0, _CONN_ROBOT_B, :]
+    )  # (N, 8, 3)
+    r_centers_1 = 0.5 * (
+        targets_r[:, 1, _CONN_ROBOT_A, :] + targets_r[:, 1, _CONN_ROBOT_B, :]
+    )  # (N, 8, 3)
+    vel_r_norm = np.linalg.norm(
+        (r_centers_1 - r_centers_0) / FRAME_RATE_S, axis=-1
+    )                                                                          # (N, 8)
+
+    return np.concatenate([distances, vel_h_norm, vel_r_norm], axis=1).astype(np.float32)
+
+
 def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
     """
     Fase 1 & 2: costruisce e salva gli artefatti offline necessari alla pipeline.
 
-    Carica il dataset di calibrazione, calcola le distanze giunto-robot al
-    frame presente (H=0), allena lo StandardScaler e il BallTree, e calcola
-    residui e covarianze globali per tutti i (joint, horizon).
+    Carica il dataset di calibrazione, calcola le feature KNN (F=38: distanze +
+    velocità), allena lo StandardScaler, e calcola residui e covarianze globali
+    per tutti i (joint, horizon).
+
+    Nota: il BallTree è stato rimosso. La ricerca KNN ora avviene tramite
+    torch.cdist batched su GPU in score_extraction.py e test_inference.py.
 
     Supporta caching: se 'offline_workspace.pkl' esiste già in exp_dir, lo
     carica direttamente senza ricalcolare.
@@ -48,14 +103,13 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
 
     Returns:
         offline_artifacts: Dizionario con chiavi:
-            'scaler'         — StandardScaler fittato su distanze di calibrazione.
-            'ball_tree'      — BallTree per ricerca KNN.
+            'scaler'         — StandardScaler fittato su feature KNN (F=38).
             'storici_residui'— {j: {h: array(N, 3)}} — residui per ogni (j, h).
             'sigma_global'   — {j: {h: array(3, 3)}} — covarianza globale.
-            'X_knn_scaled'   — Feature di distanza scalate, shape (N, 15).
+            'X_knn_scaled'   — Feature KNN scalate, shape (N, 38).
     """
     log = get_logger()
-    log.info("=== FASE 1 & 2: SETUP OFFLINE (BALLTREE SU DISTANZE) ===")
+    log.info("=== FASE 1 & 2: SETUP OFFLINE (FEATURE KNN 38D + torch.cdist) ===")
 
     out_pkl = os.path.join(exp_dir, 'offline_workspace.pkl')
     if os.path.exists(out_pkl):
@@ -70,16 +124,12 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
     targets_r = train_data['targets_robot']
     preds_h = train_data['preds']
 
-    log.info("Estrazione distanze (N, 15) al frame presente (H=0)...")
-    # Calcoliamo le distanze solo all'orizzonte 0 (presente)
-    S_train = compute_15_distances(targets_h[:, 0:1, ...], targets_r[:, 0:1, ...])[:, 0, :]
+    log.info("Calcolo feature KNN (N, 38): distanze + velocità umano/robot...")
+    X_knn = compute_knn_features(targets_h, targets_r, preds_h)  # (N, 38)
 
-    log.info("Scaling a 15 dimensioni (StandardScaler)...")
-    scaler = StandardScaler().fit(S_train)
-    S_train_scaled = scaler.transform(S_train).astype(np.float32)
-
-    log.info("Addestramento BallTree...")
-    ball_tree = BallTree(S_train_scaled)
+    log.info("Scaling a 38 dimensioni (StandardScaler)...")
+    scaler = StandardScaler().fit(X_knn)
+    X_knn_scaled = scaler.transform(X_knn).astype(np.float32)
 
     log.info("Calcolo tensore residui e sigma globali...")
     residui_train = targets_h - preds_h  # (N, 25, 15, 3)
@@ -91,8 +141,6 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
     sigma_global = {j: {} for j in range(15)}
 
     # Vettorizzazione: calcola tutte le 375 matrici di covarianza (j, h) in un solo einsum.
-    # Equivalente a np.cov(residui_train[:, h-1, j, :], rowvar=False) per ogni (j, h),
-    # ma senza 375 chiamate Python separate.
     means = residui_train.mean(axis=0)              # (25, 15, 3)
     centered = residui_train - means[np.newaxis]     # (N, 25, 15, 3)
     sigma_all = np.einsum('nhjp,nhjq->hjpq', centered, centered) / (N - 1)  # (25, 15, 3, 3)
@@ -103,16 +151,15 @@ def process_offline_data(train_data_path: str, exp_dir: str) -> dict:
             sigma_global[j][h] = sigma_all[h-1, j]
 
     offline_artifacts = {
-        'scaler': scaler, 
-        'ball_tree': ball_tree,
-        'storici_residui': storici_residui, 
-        'sigma_global': sigma_global,
-        'X_knn_scaled': S_train_scaled
+        'scaler':          scaler,
+        'storici_residui': storici_residui,
+        'sigma_global':    sigma_global,
+        'X_knn_scaled':    X_knn_scaled,    # (N, 38)
     }
-    
+
     os.makedirs(exp_dir, exist_ok=True)
     with open(out_pkl, 'wb') as f:
         pickle.dump(offline_artifacts, f)
-        
+
     log.info(f"Workspace offline salvato in '{out_pkl}'.")
     return offline_artifacts

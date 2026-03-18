@@ -15,6 +15,18 @@ N_HORIZONS: int = 25      # Frame futuri predetti (1–25)
 FRAME_RATE_MS: int = 40   # Intervallo tra frame in millisecondi (25 fps)
 FRAME_RATE_S: float = FRAME_RATE_MS / 1000.0  # Intervallo tra frame in secondi (0.04 s)
 
+# Connettività link robot: 9 giunti sequenziali → 8 link (base → end-effector).
+# Identica a CONN_ROBOT in evaluate_fcl.py; ridefinita qui per evitare import circolare.
+N_ROBOT_LINKS: int = 8
+_CONN_ROBOT_A: np.ndarray = np.arange(N_ROBOT_LINKS, dtype=np.int32)      # (8,) start joint
+_CONN_ROBOT_B: np.ndarray = np.arange(1, N_ROBOT_LINKS + 1, dtype=np.int32)  # (8,) end joint
+
+# Dimensionalità del vettore feature KNN (usato da BallTree / torch.cdist):
+#   15 distanze minime giunto→robot  (stato spaziale)
+#   15 norme velocità giunti umani   (cinematica umana, H=0→H=1)
+#    8 norme velocità link robot     (cinematica robot, H=0→H=1)
+N_KNN_FEATURES: int = N_JOINTS + N_JOINTS + N_ROBOT_LINKS  # = 38
+
 # Frazione riservata al validation set interno (split deterministico sul set di calibrazione).
 # Il 95% va al training del regressore, il 5% alla valutazione FCL.
 TRAIN_VAL_SPLIT: float = 0.05
@@ -102,28 +114,87 @@ def load_dataset(pkl_path: str) -> dict:
 def validate_offline_artifacts(artifacts: dict) -> None:
     """
     Verifica che offline_artifacts contenga tutte le chiavi obbligatorie
-    e che la dimensione delle feature sia coerente con N_JOINTS.
+    e che la dimensione delle feature sia coerente con N_KNN_FEATURES.
+
+    Nota: 'ball_tree' NON è più una chiave richiesta (rimpiazzato da torch.cdist).
+    Se un workspace vecchio contiene ancora 'ball_tree' viene ignorato silenziosamente.
+    Se X_knn_scaled ha 15 colonne (vecchio formato) viene sollevato ValueError chiaro
+    per forzare la rigenerazione del workspace con F=38.
 
     Args:
         artifacts: Dizionario prodotto da process_offline_data().
 
     Raises:
         KeyError:   Se mancano chiavi obbligatorie.
-        ValueError: Se la shape di X_knn_scaled non corrisponde a N_JOINTS.
+        ValueError: Se la shape di X_knn_scaled non corrisponde a N_KNN_FEATURES.
     """
-    required = {'scaler', 'ball_tree', 'storici_residui', 'sigma_global', 'X_knn_scaled'}
+    required = {'scaler', 'storici_residui', 'sigma_global', 'X_knn_scaled'}
     missing = required - set(artifacts.keys())
     if missing:
         raise KeyError(f"offline_artifacts: chiavi mancanti {missing}")
     n_feat = artifacts['X_knn_scaled'].shape[1]
-    if n_feat != N_JOINTS:
+    if n_feat != N_KNN_FEATURES:
         raise ValueError(
-            f"X_knn_scaled ha {n_feat} colonne, atteso N_JOINTS={N_JOINTS}. "
-            "Controlla che il workspace sia compatibile con questa versione della pipeline."
+            f"X_knn_scaled ha {n_feat} colonne, atteso N_KNN_FEATURES={N_KNN_FEATURES} "
+            f"(15 dist + 15 vel_umano + 8 vel_robot). "
+            "Elimina 'offline_workspace.pkl' per rigenerare il workspace con le nuove feature."
         )
 
 
 # ─── FEATURE ENGINEERING ──────────────────────────────────────────────────────
+
+def knn_torch_batched(
+    X_query: np.ndarray,
+    X_ref: np.ndarray,
+    k: int,
+    batch_size: int = 8000,
+) -> np.ndarray:
+    """
+    Ricerca k-NN esatta tramite torch.cdist batched su GPU (fallback CPU).
+
+    Sostituisce sklearn BallTree per trovare i k vicini più prossimi in norma L2.
+    Vantaggi rispetto a BallTree:
+      - GPU: ~15ms per 60k query contro 30k ref (F=38) vs ~60ms/query×N con BallTree
+      - Nessuna struttura ausiliaria da costruire e serializzare
+      - Scala linearmente con N_ref, ottimale per k/N >= 5% (BallTree degenera)
+
+    Memoria per chunk (GPU, batch_size=8000, N_ref=30k):
+      8000 × 30000 × 4 byte = 960 MB — sicuro con 16GB VRAM
+
+    Args:
+        X_query:    Feature di query, shape (N_query, F). Numpy float32/64.
+        X_ref:      Feature di riferimento (calibration set), shape (N_ref, F).
+        k:          Numero di vicini da restituire.
+        batch_size: Query per iterazione GPU. Riduci se OOM (default 8000).
+
+    Returns:
+        indices: Indici dei k vicini più prossimi per ogni query,
+                 shape (N_query, k), dtype int64.
+    """
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    X_ref_t = torch.tensor(X_ref, dtype=torch.float32, device=device)
+    N = len(X_query)
+    indices = np.empty((N, k), dtype=np.int64)
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        X_q_t = torch.tensor(X_query[start:end], dtype=torch.float32, device=device)
+        D = torch.cdist(X_q_t, X_ref_t)                          # (batch, N_ref)
+        _, idx = torch.topk(D, k=k, largest=False, dim=1)        # k smallest
+        indices[start:end] = idx.cpu().numpy()
+
+    del X_ref_t
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    return indices
+
 
 def build_feature_matrix(
     X_scaled: np.ndarray,
@@ -141,7 +212,8 @@ def build_feature_matrix(
     presente in train_regressor.py e test_inference.py.
 
     Args:
-        X_scaled:        Feature spaziali (distanze KNN scalate), shape (N, 15).
+        X_scaled:        Feature KNN scalate, shape (N, N_KNN_FEATURES=38).
+                         Contiene 15 distanze + 15 vel umano + 8 vel robot (scalate).
         h:               Orizzonte temporale corrente (1-indexed, range 1..25).
         scores:          Dizionario di non-conformity scores: scores[j][h] → array(N).
         group:           Lista degli indici di giunto nel gruppo cinematico del giunto corrente.

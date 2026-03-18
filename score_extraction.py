@@ -2,7 +2,7 @@ import numpy as np
 import os
 import pickle
 from tqdm import tqdm
-from pipeline_utils import KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger
+from pipeline_utils import KNN_BLEND_LOCAL, SVD_EPSILON, compute_mahalanobis_scores_batch, svd_pseudoinverse, get_logger, knn_torch_batched
 
 def compute_non_conformity_scores(offline_artifacts: dict, config: dict) -> tuple[dict, dict]:
     """
@@ -33,16 +33,18 @@ def compute_non_conformity_scores(offline_artifacts: dict, config: dict) -> tupl
     temporal_strategy = abl_cfg.get('temporal_strategy', 'per_horizon')
     
     k_neighbors = config['model_params']['k_neighbors']
-    ball_tree = offline_artifacts['ball_tree']
     X_knn_scaled = offline_artifacts['X_knn_scaled']
     storici_residui = offline_artifacts['storici_residui']
     sigma_global = offline_artifacts['sigma_global']
-    
+
     N = X_knn_scaled.shape[0]
-    
+
     if use_knn:
-        log.info(f"Interrogazione BallTree per {N} campioni (k={k_neighbors})...")
-        _, all_neighbors_indices = ball_tree.query(X_knn_scaled, k=k_neighbors)
+        # Self-query: ogni campione di calibrazione trova i propri k vicini
+        # all'interno dello stesso set (X_query = X_ref = X_knn_scaled).
+        # torch.cdist batched su GPU: ~15ms per 30k×30k (F=38) vs minuti con BallTree.
+        log.info(f"KNN (torch.cdist) per {N} campioni di calibrazione (k={k_neighbors})...")
+        all_neighbors_indices = knn_torch_batched(X_knn_scaled, X_knn_scaled, k=k_neighbors)
     
     nc_scores = {j: {h: np.zeros(N) for h in range(1, 26)} for j in range(15)}
     cov_diagonals = {j: {h: np.zeros((N, 3)) for h in range(1, 26)} for j in range(15)} 
